@@ -31,7 +31,23 @@ Our program will transform the data of the input file according to the following
 8) Wherever we find the article `a`, we should modify to `an` if the following word begins with a vowel (`a`, `e`, `i`, `o`, `u`) or an `h`. `(Ex:"It was a amazing dinner." -> "It was an amazing dinner.")` 
 
 
-## Pipeline vs Finite State Machine Architecture Models
+## Pipeline vs Streaming Finite State Machine Architecture Models
 
-Our problem can be written using either the Pipeline software architecture model or the FSM(Finite State Machine) model. Each model has its own advantages and disadvantages.
+Our problem can be written using either the Pipeline software architecture model or the streaming FSM(Finite State Machine) model. Each model has its own advantages and disadvantages.
 
+The Pipeline approach breaks the problem into a series of independent and sequential steps. Each step performs a transformation on the data according to the ruleset, and passes it to the next step.
+
+The Streaming FSM approach processes the input token by token, using a state machine to decide what to do as data flows in. It doesn't need to load the whole file, as it maintains state to apply the transformations when commands are encountered.
+
+| Feature                   |  **Pipeline**                              |  **Streaming FSM**                                    |
+| ------------------------- | ------------------------------------------ | ----------------------------------------------------- |
+| **Processing style**      | Batch / staged                             | Incremental / token by token                          |
+| **Structure**             | Sequential filters                         | State machine (Reading / Applying / etc.)             |
+| **Data handling**         | Works on entire dataset at each stage      | Processes as data flows in                            |
+| **Memory usage**          | Needs to hold all tokens                   | Keeps only recent tokens                              |
+| **Speed for large files** | Slower — multiple passes                   | Faster — single pass, streaming                       |
+| **Complexity**            | Simple, modular                            | More complex — requires state design                  |
+| **Best for**              | Smaller datasets, clear step-by-step tasks | Continuous streams, large files, real-time transforms |
+
+
+I will be experimenting with the streaming FSM architecture because it can handle all sizes of input files even though it can become quite complex in its design if we need to implement extra transformation functions down the road.
