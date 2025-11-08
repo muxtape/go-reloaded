@@ -1,64 +1,68 @@
 package main
 
 import (
-	"fmt"
-	"os"
+	"flag"
+	"log"
 
-	fsm "platform.zone01.gr/git/atampour/go-reloaded/internal/fsm"
-	modinput "platform.zone01.gr/git/atampour/go-reloaded/pkg/input"
-	moutput "platform.zone01.gr/git/atampour/go-reloaded/pkg/output"
-	tokenizer "platform.zone01.gr/git/atampour/go-reloaded/pkg/tokenizer"
+	"platform.zone01.gr/git/atampour/go-reloaded/internal/fsm"
+	inputpkg "platform.zone01.gr/git/atampour/go-reloaded/pkg/input"
+	outputpkg "platform.zone01.gr/git/atampour/go-reloaded/pkg/output"
+	"platform.zone01.gr/git/atampour/go-reloaded/pkg/tokenizer"
 )
 
-func usage() {
-	fmt.Fprintf(os.Stderr, "usage: %s <input-file> <output-file>\n", os.Args[0])
-}
+// use formatter implemented in format.go (avoid duplicating formatting logic)
 
 func main() {
-	if len(os.Args) != 3 {
-		usage()
-		os.Exit(2)
-	}
-	inPath := os.Args[1]
-	outPath := os.Args[2]
+	inPath := flag.String("in", "input.txt", "input file path")
+	outPath := flag.String("out", "output.txt", "output file path")
+	flag.Parse()
 
-	linesCh, err := modinput.ReadLines(inPath)
+	// allow positional args: prog [in-file [out-file]]
+	args := flag.Args()
+	if len(args) >= 1 {
+		*inPath = args[0]
+	}
+	if len(args) >= 2 {
+		*outPath = args[1]
+	}
+
+	linesCh, err := inputpkg.ReadLines(*inPath)
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "error opening input %q: %v\n", inPath, err)
-		os.Exit(1)
+		log.Fatalf("open input: %v", err)
 	}
 
-	outCh := make(chan string)
-	errW := make(chan error, 1)
-	go func() {
-		errW <- moutput.WriteLines(outPath, outCh)
-	}()
+	f := fsm.New()
 
-	// Process each input line independently (new FSM per line).
 	for line := range linesCh {
-		// Tokenize the input line
 		toks := tokenizer.Tokenize(line)
-		// Process tokens with a fresh FSM
-		f := fsm.New()
-		outToks, err := f.Process(toks)
-		if err != nil {
-			// on processing error, close writer and exit
-			close(outCh)
-			<-errW
-			fmt.Fprintf(os.Stderr, "processing error for line %q: %v\n", line, err)
-			os.Exit(1)
+		for _, tok := range toks {
+			if err := f.ProcessToken(tok); err != nil {
+				log.Fatalf("processing token %q: %v", tok, err)
+			}
 		}
-		// Format tokens back into a line
-		outLine := fsm.FormatTokens(outToks)
-		outCh <- outLine
+
+		// preserve original line boundary in the token stream
+		if err := f.ProcessToken(fsm.LineBreakToken); err != nil {
+			log.Fatalf("processing line break token: %v", err)
+		}
+		// Note: this pipeline preserves token stream across lines.
+		// If you need explicit line breaks preserved in output, add a special token here
+		// and extend formatting accordingly.
 	}
 
-	// finished feeding writer
-	close(outCh)
+	outTokens, err := f.Finalize()
+	if err != nil {
+		log.Fatalf("finalize FSM: %v", err)
+	}
 
-	// wait for writer to finish and check error
-	if err := <-errW; err != nil {
-		fmt.Fprintf(os.Stderr, "error writing output %q: %v\n", outPath, err)
-		os.Exit(1)
+	formatted := fsm.FormatTokens(outTokens)
+
+	// use output writer (single-line)
+	ch := make(chan string, 1)
+	ch <- formatted
+	close(ch)
+
+	if err := outputpkg.WriteLines(*outPath, ch); err != nil {
+		log.Fatalf("write output: %v", err)
 	}
 }
