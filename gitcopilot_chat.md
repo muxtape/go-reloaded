@@ -2973,3 +2973,1992 @@ GitHub Copilot:
 muxtape: why cant we continue chatting?
 
 GitHub Copilot: 
+
+
+muxtape: this is the chat we had last time about the development of the code that is present in the g0-reloaded folder.Would you be able to  further assist with the development having the context of our previous chat?
+
+Workspace: Collecting workspace informationYes — I can continue helping with development using the context in gitcopilot_chat.md.
+
+I can:
+- Run through failing tests and implement fixes (e.g. article rule, quote/tokenizer interactions).
+- Make targeted edits to FSM rules: see `fsm.Process`, `fsm.applyArticleRule`, and `fsm.applyCaseRule`.
+- Improve tokenizer/quote behavior: see `tokenizer.Tokenize`.
+- Tidy CLI wiring and pipeline: see main.go and `fsm.FormatTokens`.
+- Optimize hot paths / benchmark-guided improvements: see fsm_bench_test.go.
+
+Tell me which concrete next task you want me to do (pick one). I will:
+- run the relevant tests locally (example command below) and
+- produce a focused patch referencing the exact files/functions.
+
+```bash
+# run FSM unit tests
+cd /var/home/student/Desktop/go-reloaded
+go test ./internal/fsm -v
+```
+
+Referenced files/symbols:
+- gitcopilot_chat.md
+- fsm.go — includes `fsm.FSM`, `fsm.Process`, `fsm.FormatTokens`
+- fsm_bench_test.go
+- tokenizer.go — `tokenizer.Tokenize`
+- main.go
+
+Which of the above should I take next?
+
+muxtape: if i understand the code correctly, our project reads each line of our input.txt independantly and tokenizes its string and goes on to format and transfrom it according to our rules. If a rule has to access some words of a previous sentence our code wont be able to make those transformations. What should be the necessery changes for that to work?
+
+GitHub Copilot: GitHub Copilot
+
+You are correct: if the pipeline tokenizes and runs the FSM per-line, any rule that needs context from earlier lines (or the previous sentence) cannot see those tokens. To support cross-line rules you must stop treating each line as an independent unit and instead process a continuous token stream (or make the FSM incremental so it keeps state across lines).
+
+Recommended minimal changes (summary)
+- Make the FSM incremental: add per-token processing and a Finalize() method instead of only Process([]string). Keep Process([]string) as a convenience wrapper.
+- Keep FSM internal output buffer (out []string) and pending-rule state (for rules that need lookahead, e.g. (a/an)).
+- Modify the CLI / pipeline to create one FSM per entire input stream and feed tokens continuously (call tokenizer per-line but do not reset the FSM between lines). After the whole stream, call FSM.Finalize() to get remaining output and perform final checks (unclosed quotes, normalizeArticles).
+- Update tests to exercise streaming behavior.
+
+Concrete changes — patch for fsm.go
+- add fields to FSM
+- add ProcessToken(tok string) error and Finalize() ([]string, error)
+- implement pendingArticle handling so "(a/an)" can wait until the next word token arrives (or error at Finalize if no next word)
+- leave Process(tokens []string) as a convenience that uses the incremental methods
+
+Apply the change below (insert into your fsm.go). I show only added/changed regions so you can integrate into the current file:
+
+````go
+// ...existing code...
+type FSM struct {
+    state       State
+    transitions map[State]map[Event]State
+    quoteOpen   bool // track single-quote open/close state
+
+    // streaming/incremental fields:
+    out            []string // accumulated output tokens
+    pendingArticle bool     // true when we've seen "(a/an)" but not yet applied (waiting for next word)
+}
+// ...existing code...
+
+// ProcessToken handles a single token in streaming mode.
+// It updates internal FSM state and the internal output buffer.
+// It does not perform EOF checks; call Finalize() when input is finished.
+func (f *FSM) ProcessToken(tok string) error {
+    // Treat single-quote as quote delimiter: toggle quote state and emit token.
+    if tok == "'" {
+        if err := f.SendEvent(EventToken); err != nil {
+            return fmt.Errorf("on token %q: %w", tok, err)
+        }
+        f.quoteOpen = !f.quoteOpen
+        f.out = append(f.out, tok)
+        return nil
+    }
+
+    // If we previously saw an "(a/an)" and are waiting for the next word,
+    // do not apply article rule until a word token arrives. If current tok is punctuation,
+    // keep waiting (emit punctuation into out, do not resolve pendingArticle).
+    if f.pendingArticle && tokenHasLetter(tok) {
+        // find nearest preceding article "a"/"A" and adjust based on first letter of tok
+        j := len(f.out) - 1
+        found := -1
+        for j >= 0 {
+            if strings.ToLower(f.out[j]) == "a" {
+                found = j
+                break
+            }
+            j--
+        }
+        if found == -1 {
+            // no preceding article to apply to -> it's an error per previous behavior
+            f.pendingArticle = false
+            return fmt.Errorf("on token %q: no preceding article 'a' found for (a/an)", tok)
+        }
+        firstRune, ok := firstLetterOrDigit(tok)
+        if !ok {
+            f.pendingArticle = false
+            return fmt.Errorf("on token %q: empty next token for article rule", tok)
+        }
+        if firstRune == 'a' || firstRune == 'e' || firstRune == 'i' || firstRune == 'o' || firstRune == 'u' || firstRune == 'h' {
+            if f.out[found] == "A" {
+                f.out[found] = "An"
+            } else {
+                f.out[found] = "an"
+            }
+        }
+        f.pendingArticle = false
+        // fall through and treat current tok as normal token (it will be appended below)
+    }
+
+    // Rule tokens (parenthesized)
+    if len(tok) > 0 && tok[0] == '(' {
+        if err := f.SendEvent(EventRule); err != nil {
+            return fmt.Errorf("on token %q: %w", tok, err)
+        }
+        lower := strings.ToLower(tok)
+        switch lower {
+        case "(hex)":
+            if err := f.applyHexRule(&f.out); err != nil {
+                return fmt.Errorf("on token %q: %w", tok, err)
+            }
+        case "(bin)":
+            if err := f.applyBinRule(&f.out); err != nil {
+                return fmt.Errorf("on token %q: %w", tok, err)
+            }
+        case "(a/an)":
+            // mark pending and wait for next word token to apply
+            f.pendingArticle = true
+        default:
+            if strings.HasPrefix(lower, "(up") || strings.HasPrefix(lower, "(low") || strings.HasPrefix(lower, "(cap") {
+                if err := f.applyCaseRule(tok, &f.out); err != nil {
+                    return fmt.Errorf("on token %q: %w", tok, err)
+                }
+            }
+            // unknown rules are no-op
+        }
+        if err := f.SendEvent(EventEmit); err != nil {
+            return fmt.Errorf("on token %q: %w", tok, err)
+        }
+        if err := f.SendEvent(EventToken); err != nil {
+            return fmt.Errorf("on token %q: %w", tok, err)
+        }
+        return nil
+    }
+
+    // Regular token: append and advance
+    if err := f.SendEvent(EventToken); err != nil {
+        return fmt.Errorf("on token %q: %w", tok, err)
+    }
+    f.out = append(f.out, tok)
+    return nil
+}
+
+// Finalize completes processing for the stream, checks for errors (unclosed quotes,
+// unresolved pending rules), runs any global normalizations, and returns the final token slice.
+func (f *FSM) Finalize() ([]string, error) {
+    // Signal EOF
+    if err := f.SendEvent(EventEOF); err != nil {
+        return nil, err
+    }
+
+    if f.quoteOpen {
+        return nil, fmt.Errorf("unclosed single-quote at EOF")
+    }
+    if f.pendingArticle {
+        return nil, fmt.Errorf("pending (a/an) rule at EOF without following word")
+    }
+
+    // automatic article normalization (applies even without explicit rule token)
+    normalizeArticles(&f.out)
+
+    // return a copy (so callers can still mutate f.out if needed)
+    outCopy := make([]string, len(f.out))
+    copy(outCopy, f.out)
+    return outCopy, nil
+}
+
+// Process remains as a convenience wrapper that uses the streaming API.
+func (f *FSM) Process(tokens []string) ([]string, error) {
+    // reset any streaming fields
+    f.out = nil
+    f.pendingArticle = false
+    f.quoteOpen = false
+    f.state = READ
+
+    for _, tok := range tokens {
+        if err := f.ProcessToken(tok); err != nil {
+            return nil, err
+        }
+    }
+    return f.Finalize()
+}
+// ...existing code...
+````
+
+Pipeline/CLI changes
+- In main.go (or whichever wiring currently tokenizes per-line), do the following:
+  - Create one FSM (f := fsm.New()) at the start of processing the file.
+  - For each line read from ReadLines:
+    - Call tokenizer.Tokenize(line) to get tokens.
+    - For each token, call f.ProcessToken(token). Handle errors.
+  - After input done, call outTokens, err := f.Finalize(). Then FormatTokens(outTokens) and WriteLines or write the formatted string.
+
+Why this works
+- The FSM keeps its internal out buffer and rule state across lines, so rules that apply to previous tokens (even if those tokens were in previous lines) can be applied.
+- Pending lookahead rules (like (a/an)) no longer require passing the whole token slice; they are resolved when the next word token arrives.
+- Automatic normalization still runs at Finalize, preserving previous behavior.
+
+Notes / follow-ups
+- If you need stricter streaming (emit tokens as soon as available rather than waiting until Finalize), change ProcessToken to return emitted tokens (e.g., tokens that are "finalized" and safe to write). For many rules you can emit tokens immediately; for (a/an) you must defer emission of ambiguous context until resolved. The current suggestion buffers everything and emits at Finalize; that is simplest and safe.
+- Update unit tests to exercise ProcessToken+Finalize streaming semantics (e.g., feed tokens in two batches crossing a line boundary) and the CLI to feed the FSM continuously.
+- If you want to preserve memory, you can alter FSM to periodically flush earlier tokens that are no longer needed (e.g., once there are no pending rules that could affect them). That is a more advanced optimization.
+
+If you want, I can:
+- produce the actual edits to main.go to wire streaming FSM,
+- update a few unit tests to show cross-line behavior,
+- or implement ProcessToken returning immediately-emittable tokens (streaming writer friendly).
+
+Which should I do next?
+
+muxtape: running the tests after applying only the changes to fsm.go i get the following fails :
+RUN   TestFSM_Article_Vowel
+    fsm_article_test.go:15: Process returned error: pending (a/an) rule at EOF without following word
+--- FAIL: TestFSM_Article_Vowel (0.00s)
+=== RUN   TestFSM_Article_H
+    fsm_article_test.go:32: Process returned error: pending (a/an) rule at EOF without following word
+--- FAIL: TestFSM_Article_H (0.00s)
+=== RUN   TestFSM_Article_NoChange
+    fsm_article_test.go:46: Process returned error: pending (a/an) rule at EOF without following word
+--- FAIL: TestFSM_Article_NoChange (0.00s)
+
+is this expected because i havent implemented the changes to main.go and to other files? If not what should be our next step to correcting those fails?
+
+GitHub Copilot: No — those failures are not caused by main.go. They indicate the FSM left a pending (a/an) unresolved at EOF because Process currently only uses ProcessToken and sometimes never resolves an article rule that can be resolved by looking ahead inside the token slice.
+
+Fix: make Process attempt to resolve "(a/an)" using the token slice / current index (lookahead) before falling back to setting pendingArticle. That keeps Process working when tests call f.Process(tokens) (no changes to main.go needed).
+
+Apply this patch to replace the Process implementation:
+
+````go
+// ...existing code...
+func (f *FSM) Process(tokens []string) ([]string, error) {
+    // reset any streaming fields
+    f.out = nil
+    f.pendingArticle = false
+    f.quoteOpen = false
+    f.state = READ
+
+    for i, tok := range tokens {
+        // Try to resolve article rules immediately when we have the full token slice.
+        if len(tok) > 0 && tok[0] == '(' && strings.ToLower(tok) == "(a/an)" {
+            // Attempt to apply article rule using lookahead in tokens.
+            if err := f.applyArticleRule(&f.out, tokens, i); err != nil {
+                // If there's simply no following word yet, keep it pending and continue.
+                // This allows behavior both for full-batch and streaming usage.
+                if strings.Contains(err.Error(), "no following word") || strings.Contains(err.Error(), "no following") {
+                    f.pendingArticle = true
+                    continue
+                }
+                return nil, err
+            }
+            // Successfully applied the article rule; continue without calling ProcessToken on the rule token.
+            continue
+        }
+
+        if err := f.ProcessToken(tok); err != nil {
+            return nil, err
+        }
+    }
+    return f.Finalize()
+}
+// ...existing code...
+````
+
+After applying, run the FSM tests:
+
+```bash
+cd /var/home/student/Desktop/go-reloaded
+go test ./internal/fsm -v
+```
+
+If any tests still fail, run the failing test with additional logging (or paste the failing test name and token sequence) and I will provide the next targeted change.
+
+muxtape: Ok. Now it passes all the tests. Lets proceed wtih the Pipeline/CLI changes.
+
+GitHub Copilot: GitHub Copilot
+
+I added a simple CLI pipeline that wires the streaming FSM, tokenizer, and file IO. It reads the whole input stream, feeds tokens continuously to the FSM (streaming via ProcessToken), finalizes the FSM at EOF, formats tokens back to text, and writes a single output line to the output file.
+
+Changes added:
+- main.go
+
+Run from project root:
+- go build ./cmd
+- ./cmd -in input.txt -out output.txt
+- or run tests as before: go test ./...
+
+File added:
+
+````go
+package main
+
+import (
+    "flag"
+    "fmt"
+    "log"
+    "os"
+    stringspkg "strings"
+
+    inputpkg "https://platform.zone01.gr/git/atampour/go-reloaded/pkg/input"
+    outputpkg "https://platform.zone01.gr/git/atampour/go-reloaded/pkg/output"
+    "https://platform.zone01.gr/git/atampour/go-reloaded/pkg/tokenizer"
+    "https://platform.zone01.gr/git/atampour/go-reloaded/internal/fsm"
+)
+
+// simple formatter: joins tokens into a readable string. Avoids space before common punctuation.
+func formatTokens(tokens []string) string {
+    if len(tokens) == 0 {
+        return ""
+    }
+    var b stringspkg.Builder
+    punctuationNoSpaceBefore := map[string]bool{
+        ".": true, ",": true, "!": true, "?": true, ";": true, ":": true, ")": true, "]": true,
+    }
+    openingNoSpaceAfter := map[string]bool{
+        "(": true, "[": true,
+    }
+
+    b.WriteString(tokens[0])
+    prev := tokens[0]
+    for _, tok := range tokens[1:] {
+        // no space before punctuation
+        if punctuationNoSpaceBefore[tok] {
+            b.WriteString(tok)
+            prev = tok
+            continue
+        }
+        // no space after opening punctuation
+        if openingNoSpaceAfter[prev] {
+            b.WriteString(tok)
+            prev = tok
+            continue
+        }
+        // apostrophe/closing single quote attach directly
+        if tok == "'" || tok == "’" {
+            b.WriteString(tok)
+            prev = tok
+            continue
+        }
+        // default: add space then token
+        b.WriteString(" ")
+        b.WriteString(tok)
+        prev = tok
+    }
+    return b.String()
+}
+
+func main() {
+    inPath := flag.String("in", "input.txt", "input file path")
+    outPath := flag.String("out", "output.txt", "output file path")
+    flag.Parse()
+
+    linesCh, err := inputpkg.ReadLines(*inPath)
+    if err != nil {
+        log.Fatalf("open input: %v", err)
+    }
+
+    f := fsm.New()
+
+    for line := range linesCh {
+        toks := tokenizer.Tokenize(line)
+        for _, tok := range toks {
+            if err := f.ProcessToken(tok); err != nil {
+                log.Fatalf("processing token %q: %v", tok, err)
+            }
+        }
+        // Note: this pipeline preserves token stream across lines.
+        // If you need explicit line breaks preserved in output, add a special token here
+        // and extend formatting accordingly.
+    }
+
+    outTokens, err := f.Finalize()
+    if err != nil {
+        log.Fatalf("finalize FSM: %v", err)
+    }
+
+    formatted := formatTokens(outTokens)
+
+    // use output writer (single-line)
+    ch := make(chan string, 1)
+    ch <- formatted
+    close(ch)
+
+    if err := outputpkg.WriteLines(*outPath, ch); err != nil {
+        log.Fatalf("write output: %v", err)
+    }
+
+    fmt.Fprintf(os.Stdout, "wrote %d tokens to %s\n", len(outTokens), *outPath)
+}
+````
+
+If you want:
+- preserve original line boundaries in output, I can add a line-break token and extend formatting.
+- stream output incrementally (emit finalized tokens as they become safe) I can implement ProcessToken to return immediately-emittable tokens and adapt WriteLines call to receive them. Which do you prefer?
+
+muxtape: Why did you add a formatTokens() func in main when we already have a format.go file?
+
+GitHub Copilot: You're right — that was a duplicate. I added formatTokens in main by mistake instead of using the existing formatter. Remove the duplicate and call the central formatter from format.go so there's a single source of truth.
+
+Apply this change to cmd/main.go:
+
+````go
+// ...existing code...
+-import (
+-	"flag"
+-	"fmt"
+-	"log"
+-	"os"
+-	stringspkg "strings"
+-
+-	"platform.zone01.gr/git/atampour/go-reloaded/internal/fsm"
+-	inputpkg "platform.zone01.gr/git/atampour/go-reloaded/pkg/input"
+-	outputpkg "platform.zone01.gr/git/atampour/go-reloaded/pkg/output"
+-	"platform.zone01.gr/git/atampour/go-reloaded/pkg/tokenizer"
+-)
++import (
++	"flag"
++	"fmt"
++	"log"
++	"os"
++
++	"platform.zone01.gr/git/atampour/go-reloaded/internal/fsm"
++	inputpkg "platform.zone01.gr/git/atampour/go-reloaded/pkg/input"
++	outputpkg "platform.zone01.gr/git/atampour/go-reloaded/pkg/output"
++	"platform.zone01.gr/git/atampour/go-reloaded/pkg/tokenizer"
++)
+ 
+-// simple formatter: joins tokens into a readable string. Avoids space before common punctuation.
+-func formatTokens(tokens []string) string {
+-	if len(tokens) == 0 {
+-		return ""
+-	}
+-	var b stringspkg.Builder
+-	punctuationNoSpaceBefore := map[string]bool{
+-		".": true, ",": true, "!": true, "?": true, ";": true, ":": true, ")": true, "]": true,
+-	}
+-	openingNoSpaceAfter := map[string]bool{
+-		"(": true, "[": true,
+-	}
+-
+-	b.WriteString(tokens[0])
+-	prev := tokens[0]
+-	for _, tok := range tokens[1:] {
+-		// no space before punctuation
+-		if punctuationNoSpaceBefore[tok] {
+-			b.WriteString(tok)
+-			prev = tok
+-			continue
+-		}
+-		// no space after opening punctuation
+-		if openingNoSpaceAfter[prev] {
+-			b.WriteString(tok)
+-			prev = tok
+-			continue
+-		}
+-		// apostrophe/closing single quote attach directly
+-		if tok == "'" || tok == "’" {
+-			b.WriteString(tok)
+-			prev = tok
+-			continue
+-		}
+-		// default: add space then token
+-		b.WriteString(" ")
+-		b.WriteString(tok)
+-		prev = tok
+-	}
+-	return b.String()
+-}
++// use formatter implemented in format.go (avoid duplicating formatting logic)
+ // ...existing code...
+ 
+ 	outTokens, err := f.Finalize()
+ 	if err != nil {
+ 		log.Fatalf("finalize FSM: %v", err)
+ 	}
+-
+-	formatted := formatTokens(outTokens)
++	formatted := fsm.FormatTokens(outTokens)
+ 
+ // use output writer (single-line)
+ ch := make(chan string, 1)
+ ch <- formatted
+ close(ch)
+ // ...existing code...
+````
+
+After this change run:
+```bash
+cd /var/home/student/Desktop/go-reloaded
+go test ./... && go build ./cmd
+```
+
+If fsm.FormatTokens has a different name or lives in another package, tell me the symbol/path and I will update the call.
+
+muxtape: Ok. All tests pass. Now if try to run my program would i be able to apply formating chages to previous lines, or i need to do more changes?
+
+GitHub Copilot: GitHub Copilot
+
+Short answer
+- Right now: yes — your program can apply transformations that affect tokens from previous lines, because the FSM keeps a single accumulated out buffer across lines and Finalize() applies normalization at EOF. So cross-line rules work — but only when you finalize and write output at the end.
+- If you need incremental/streaming output (write while reading) or preserve original line boundaries while still applying retroactive changes, you will need more changes.
+
+Options and next steps
+
+1) Keep current behavior (no change)
+- Behavior: all cross-line transforms apply correctly; output written only after EOF.
+- Use when you can buffer whole input and output at the end.
+
+2) Preserve line boundaries in the final output
+- Minimal: after you process each input line in cmd/main.go, append a special token (e.g. "<LINE_BREAK>") into the FSM (call ProcessToken on it) and update fsm.FormatTokens to render that token as a newline (or to break output into lines). This does not change streaming semantics (still finalizes at EOF) but preserves where original line breaks were.
+
+3) Stream output incrementally while still allowing some retroactive changes
+- Requires FSM to expose which buffered tokens are safe to emit (flush). Approaches:
+  - Add a new FSM method that returns tokens safe to emit now, e.g. EmitReady() ([]string). Call it after every ProcessToken and send emitted strings to WriteLines.
+  - Or add ProcessTokenEmit(tok string) ([]string, error) that both processes tok and returns newly-finalized tokens to write.
+- You must decide/implement a "safety" rule: tokens that can still be modified by later rules must not be flushed. If rules may alter an unbounded history, you cannot safely flush until EOF. If all lookback rules have a bounded window (e.g. cap,N where N <= MaxLookback), you can flush tokens older than MaxLookback.
+
+Example: API sketch (non-breaking, add new method)
+````go
+// ...existing code...
+// ProcessTokenEmit processes tok and returns tokens that are safe to emit now.
+// It does not remove them from FSM history (or it may remove them if you want).
+func (f *FSM) ProcessTokenEmit(tok string) ([]string, error) {
+    if err := f.ProcessToken(tok); err != nil {
+        return nil, err
+    }
+    // Simple conservative policy: emit nothing while there is any pendingArticle.
+    if f.pendingArticle {
+        return nil, nil
+    }
+    // Example conservative flush: emit all tokens except last K tokens,
+    // where K is the max lookback needed by any rule.
+    const MaxLookback = 5
+    n := len(f.out) - MaxLookback
+    if n <= 0 {
+        return nil, nil
+    }
+    ready := make([]string, n)
+    copy(ready, f.out[:n])
+    // Optionally remove them from the buffer if you want to free memory:
+    f.out = f.out[n:]
+    return ready, nil
+}
+// ...existing code...
+````
+Then update main.go to open an output channel and send emitted strings to WriteLines as they arrive.
+
+4) If you want full retroactivity with immediate writes (no buffering) — not generally possible
+- If rules can reference arbitrary previous tokens, you cannot both write those tokens to disk and later change them. You must buffer until you know no future rule can change them (or accept rewriting later, logging patches, etc).
+
+Recommendation
+- If you only need cross-line transforms at EOF: no more changes required.
+- If you want to preserve line breaks: add a simple line-break token per line and handle it in FormatTokens.
+- If you want streaming writes: implement ProcessTokenEmit / EmitReady and choose a safe flush policy (or impose a max lookback for rules). I can implement one of these for you — which do you want next: (A) preserve line breaks, (B) add ProcessTokenEmit with a conservative MaxLookback flush, or (C) implement fully streaming writer that re-writes previous lines when changed?
+
+muxtape: when i try to run my program with the first argument being sample.txt and the second argument being output.txt i get the following error
+2025/11/08 13:26:07 open input: open input.txt: no such file or directory
+exit status 1
+
+why is that? I should be able to use whatever file i want as input and then make output the transformation changes to the output file of the second argument.
+
+GitHub Copilot: The program used the default flag values ("input.txt"/"output.txt") because you passed positional args instead of flags. You have two options:
+
+1) Run without code changes (use flags)
+- ./cmd -in sample.txt -out output.txt
+
+2) Make main accept positional args (arg1 = input, arg2 = output). Add this small change after flag.Parse().
+
+````go
+// ...existing code...
+	flag.Parse()
+
+	// allow positional args: prog [in-file [out-file]]
+	args := flag.Args()
+	if len(args) >= 1 {
+		*inPath = args[0]
+	}
+	if len(args) >= 2 {
+		*outPath = args[1]
+	}
+
+	linesCh, err := inputpkg.ReadLines(*inPath)
+	// ...existing code...
+````
+
+After editing, rebuild and run:
+
+- go build ./cmd
+- ./cmd sample.txt output.txt
+
+Either approach will let you use whatever input and output filenames you want.
+
+muxtape: When i run my program the output file contains the transformations into a single line. I would like to preserve the original line structure of the input file
+
+GitHub Copilot: You're adding a line-break sentinel into the token stream and rendering it as a real newline during formatting. That preserves the original line boundaries while keeping the FSM streaming behaviour and cross-line transforms.
+
+Apply these two small edits.
+
+1) Export a line-break token and update FormatTokens in the FSM package.
+
+````go
+// ...existing code...
+const (
+    READ State = iota
+    APPLY_RULE
+    OUTPUT
+    END
+)
+
+// exported token used to mark original input line breaks
+const LineBreakToken = "<LINE_BREAK>"
+
+func (s State) String() string {…}
+...
+// Replace or add FormatTokens implementation to recognize LineBreakToken:
+func FormatTokens(tokens []string) string {
+    if len(tokens) == 0 {
+        return ""
+    }
+
+    var b strings.Builder
+    punctuationNoSpaceBefore := map[string]bool{
+        ".": true, ",": true, "!": true, "?": true, ";": true, ":": true, ")": true, "]": true,
+    }
+    openingNoSpaceAfter := map[string]bool{
+        "(": true, "[": true,
+    }
+
+    first := true
+    prev := ""
+    for _, tok := range tokens {
+        if tok == LineBreakToken {
+            // emit newline and reset "prev" so formatting after newline behaves like line start
+            b.WriteByte('\n')
+            prev = ""
+            first = false
+            continue
+        }
+
+        if first {
+            b.WriteString(tok)
+            prev = tok
+            first = false
+            continue
+        }
+
+        // no space before punctuation
+        if punctuationNoSpaceBefore[tok] {
+            b.WriteString(tok)
+            prev = tok
+            continue
+        }
+        // no space after opening punctuation
+        if openingNoSpaceAfter[prev] {
+            b.WriteString(tok)
+            prev = tok
+            continue
+        }
+        // apostrophe/closing single quote attach directly
+        if tok == "'" || tok == "’" {
+            b.WriteString(tok)
+            prev = tok
+            continue
+        }
+        // default: add space then token
+        b.WriteByte(' ')
+        b.WriteString(tok)
+        prev = tok
+    }
+    return b.String()
+}
+// ...existing code...
+````
+
+2) Emit the sentinel after each input line in cmd/main.go.
+
+````go
+// ...existing code...
+	for line := range linesCh {
+		toks := tokenizer.Tokenize(line)
+		for _, tok := range toks {
+			if err := f.ProcessToken(tok); err != nil {
+				log.Fatalf("processing token %q: %v", tok, err)
+			}
+		}
+
+		// preserve original line boundary in the token stream
+		if err := f.ProcessToken(fsm.LineBreakToken); err != nil {
+			log.Fatalf("processing line break token: %v", err)
+		}
+	}
+ // ...existing code...
+````
+
+Rebuild and run:
+
+- go build ./cmd
+- ./cmd sample.txt output.txt
+
+Result: output.txt will contain the transformed text with the same line breaks as the input.
+
+muxtape: You implemented the FormatTokens() func inside fsm.go instead of changing the already existing FormatTokens() func that is in the format.go file 
+
+GitHub Copilot: Remove the duplicate formatter from fsm.go so the package uses the single canonical FormatTokens in format.go.
+
+Edit the file and delete the FormatTokens function (the whole function from its signature down to the closing brace). Example patch (replace the duplicate with a short comment):
+
+````go
+// ...existing code...
+// Removed duplicate FormatTokens implementation. Use the canonical FormatTokens
+// implementation in format.go (same package) to avoid duplication/conflict.
+// ...existing code...
+````
+
+After removing the function, rebuild/run tests:
+
+````bash
+cd /var/home/student/Desktop/go-reloaded
+go test ./... && go build ./cmd
+````
+
+If the build fails because FormatTokens is not found, open format.go and confirm it declares:
+- package fsm
+- func FormatTokens(tokens []string) string
+
+Tell me if you want, and I will create the exact edit for you.
+
+muxtape: Did you make some changes when you implemented the FormatTokens() in fsm.go that should be present in the FormatTokens() in format.go? Check format.go and tell me
+
+GitHub Copilot: Yes — the copy you added in fsm.go introduced handling for the LineBreakToken and some small differences in quote/punctuation handling that are not present in internal/fsm/format.go. Concretely:
+
+- format.go does not handle the exported LineBreakToken; it never emits newlines and thus flattens output.
+- format.go does not treat a token following a LineBreakToken as a line-start (no special "first token" behavior).
+- format.go only handles ASCII single-quote "'" but not the Unicode right single quote "’" that the fsm version considered.
+- fsm.go reset/first-line logic around line breaks is missing from format.go.
+
+Apply this patch to replace FormatTokens in format.go to keep one canonical implementation and add line-break support:
+
+````go
+// ...existing code...
+package fsm
+
+import "strings"
+
+// FormatTokens joins token slice into a single string applying punctuation spacing rules.
+// Rules implemented:
+// - No space before closing punctuation: . , ! ? ; : ) ] }
+// - Space before opening punctuation like '(' but no space immediately after it: "word (note)"
+// - Single-quote handling: opening quote has a space before it (unless first token) and no space after it;
+//   closing quote has no space before it and (if next token requires) a space after it.
+// - Treat other tokens normally (one space between words).
+func FormatTokens(tokens []string) string {
+    if len(tokens) == 0 {
+        return ""
+    }
+
+    closing := map[string]bool{
+        ".": true, ",": true, "!": true, "?": true, ";": true, ":": true,
+        ")": true, "]": true, "}": true,
+        "...": true,
+    }
+
+    opening := map[string]bool{
+        "(": true, "[": true, "{": true,
+    }
+
+    var b strings.Builder
+    quoteOpen := false
+
+    for i, tok := range tokens {
+        // Line break sentinel handling: emit newline and treat next token as line-start.
+        if tok == LineBreakToken {
+            b.WriteByte('\n')
+            continue
+        }
+
+        // If this is the first token in the entire output, write it plainly.
+        if i == 0 {
+            b.WriteString(tok)
+            if tok == "'" || tok == "’" {
+                quoteOpen = !quoteOpen
+            }
+            continue
+        }
+
+        prevTok := tokens[i-1]
+
+        // If previous token was a line break sentinel, treat current token as line-start.
+        if prevTok == LineBreakToken {
+            b.WriteString(tok)
+            if tok == "'" || tok == "’" {
+                quoteOpen = !quoteOpen
+            }
+            continue
+        }
+
+        // Handle single-quote tokens: opening vs closing (consider ASCII and Unicode apostrophe)
+        if tok == "'" || tok == "’" {
+            if !quoteOpen {
+                // opening quote: add space before (normal), then no space after (handled by next token)
+                b.WriteByte(' ')
+                b.WriteString(tok)
+                quoteOpen = true
+                continue
+            }
+            // closing quote: no space before closing quote
+            b.WriteString(tok)
+            quoteOpen = false
+            continue
+        }
+
+        // If previous token was a quote opening, no space between quote and next token
+        if prevTok == "'" || prevTok == "’" && quoteOpen {
+            b.WriteString(tok)
+            continue
+        }
+
+        // If current token is a closing punctuation, do not add a space before it.
+        if closing[tok] {
+            b.WriteString(tok)
+            continue
+        }
+
+        // If previous token is an opening punctuation, do not add a space before current token.
+        if opening[prevTok] {
+            b.WriteString(tok)
+            continue
+        }
+
+        // Otherwise, add a single space before current token.
+        b.WriteByte(' ')
+        b.WriteString(tok)
+    }
+
+    return b.String()
+}
+// ...existing code...
+````
+
+Rebuild and run:
+- go test ./...
+- go build ./cmd
+- ./cmd sample.txt output.txt
+
+This will preserve original line breaks in output and keep formatting consistent.
+
+muxtape: When i have the following text as input:
+This is a ' tricky (up) ' sample text
+
+i would expect my output to be:
+This is a 'TRICKY' sample text
+
+instead i get the following output when i run my program:
+This is a 'TRICKY'sample text
+
+there should be a space after closing the quote.
+
+GitHub Copilot: You're right — the conditional that detects an opening quote is wrong due to operator precedence. It treats any previous quote token as "no-space" even when the quote is a closing quote. Change the condition to require quoteOpen as well.
+
+Apply this edit:
+
+````go
+// ...existing code...
+        // If previous token was a quote opening, no space between quote and next token
+-        if prevTok == "'" || prevTok == "’" && quoteOpen {
++        if (prevTok == "'" || prevTok == "’") && quoteOpen {
+             b.WriteString(tok)
+             continue
+         }
+ // ...existing code...
+````
+
+Rebuild and run:
+- go test ./...
+- go build ./cmd
+- ./cmd sample.txt output.txt
+
+That will insert the missing space after a closing quote while preserving the no-space behavior for opening quotes.
+
+muxtape:     isWordChar := func(r rune) bool {
+        // Accept letters, digits, apostrophe and hyphen as part of word tokens.
+        return unicode.IsLetter(r) || unicode.IsDigit(r) || /*r == '\'' ||*/ r == '-'
+    }
+
+    Let me know if my thinking is correct on the following:
+    
+    I commented out the above snipet of code (/*r == '\'' ||*/) so i can exclude words that are adjacent to a single quote to interfere with the opening and closing quoute rule.So now when i have text like: test 'hello ' test ,
+    it correctly closes the quotes around the word hello instead of throwing an error of not having found the closing quote. 
+    Making this change i stopped regarding words like don't or it's from being present in my text so as not to make more problems for my code.
+
+GitHub Copilot: GitHub Copilot
+
+Your thinking is correct: commenting out the apostrophe from isWordChar makes standalone single-quote tokens behave as quote delimiters, but it also breaks contractions (don't, it's). Better approach: treat an apostrophe as part of a word only when it is inside a word (letters/digits on both sides); otherwise emit it as a separate quote token. That preserves contractions and lets the FSM handle opening/closing quotes reliably.
+
+Apply this change to pkg/tokenizer/tokenizer.go:
+
+````go
+package tokenizer
+
+import (
+	"strings"
+	"unicode"
+)
+
+// ...existing code...
+
+func Tokenize(s string) []string {
+	// ...existing code...
+
+	isWordChar := func(r rune) bool {
+		// Accept letters, digits and hyphen as part of word tokens.
+		return unicode.IsLetter(r) || unicode.IsDigit(r) || r == '-'
+	}
+
+	for i := 0; i < n; i++ {
+		r := runes[i]
+
+		// Whitespace: flush current word and continue.
+		if unicode.IsSpace(r) {
+			flushWord()
+			continue
+		}
+
+		// Parenthesized command: capture until the next ')' (inclusive).
+		if r == '(' {
+			flushWord()
+			var cmd strings.Builder
+			cmd.WriteRune(r)
+			j := i + 1
+			for ; j < n; j++ {
+				cmd.WriteRune(runes[j])
+				if runes[j] == ')' {
+					break
+				}
+			}
+			i = j
+			toks = append(toks, cmd.String())
+			continue
+		}
+
+		// Special handling for apostrophe: include inside word only when surrounded by letters/digits.
+		if r == '\'' || r == '’' {
+			prevIsLetter := i-1 >= 0 && unicode.IsLetter(runes[i-1]) || i-1 >= 0 && unicode.IsDigit(runes[i-1])
+			nextIsLetter := i+1 < n && unicode.IsLetter(runes[i+1]) || i+1 < n && unicode.IsDigit(runes[i+1])
+			if prevIsLetter && nextIsLetter {
+				// treat as part of the current word
+				b.WriteRune(r)
+				continue
+			}
+			// otherwise treat apostrophe as its own token (quote)
+			flushWord()
+			toks = append(toks, string(r))
+			continue
+		}
+
+		// Word characters
+		if isWordChar(r) {
+			b.WriteRune(r)
+			continue
+		}
+
+		// Punctuation or other symbol: flush any word, then emit the symbol as a token.
+		flushWord()
+		toks = append(toks, string(r))
+	}
+
+	flushWord()
+	return toks
+}
+````
+
+Run tests and try sample inputs:
+- go test ./...
+- go build ./cmd && ./cmd sample.txt output.txt
+
+This preserves contractions and emits single quotes as quote tokens when they are delimiter-like, fixing the quote-spacing/closing behavior without losing words like don't.
+
+muxtape: Whouldnt this make a problem when my original text is something like:
+test'word hello world'
+In that case i would like my program to have the output of :
+test 'word hello world'
+because test'word isn't a word that should need an apostrophe inside it
+
+GitHub Copilot: GitHub Copilot
+
+Your concern is valid. A good heuristic is: treat an apostrophe as a quote delimiter if there's a matching apostrophe later in the same input (a quote span). Otherwise treat it as part of a word (contraction) only when surrounded by letters/digits. The patch below implements that lookahead rule so inputs like
+
+test'word hello world'
+
+tokenize as: ["test", "'", "word", "hello", "world", "'"]
+
+while contractions like don't remain a single token.
+
+Apply this change:
+
+````go
+package tokenizer
+
+import (
+	"strings"
+	"unicode"
+)
+
+// ...existing code...
+func Tokenize(s string) []string {
+	var toks []string
+	var b strings.Builder
+	runes := []rune(s)
+	n := len(runes)
+
+	flushWord := func() {
+		if b.Len() > 0 {
+			toks = append(toks, b.String())
+			b.Reset()
+		}
+	}
+
+	isWordChar := func(r rune) bool {
+		// Accept letters, digits and hyphen as part of word tokens.
+		return unicode.IsLetter(r) || unicode.IsDigit(r) || r == '-'
+	}
+
+	for i := 0; i < n; i++ {
+		r := runes[i]
+
+		// Whitespace: flush current word and continue.
+		if unicode.IsSpace(r) {
+			flushWord()
+			continue
+		}
+
+		// Parenthesized command: capture until the next ')' (inclusive).
+		if r == '(' {
+			flushWord()
+			var cmd strings.Builder
+			cmd.WriteRune(r)
+			j := i + 1
+			for ; j < n; j++ {
+				cmd.WriteRune(runes[j])
+				if runes[j] == ')' {
+					break
+				}
+			}
+			// advance i to j (if j reached n without ')', it will include rest)
+			i = j
+			toks = append(toks, cmd.String())
+			continue
+		}
+
+		// Special handling for apostrophe: decide between contraction vs quote delimiter.
+		if r == '\'' || r == '’' {
+			// Look for a later matching apostrophe (quote close). If found, treat current
+			// apostrophe as a quote delimiter (open/close) even if adjacent to letters.
+			foundClose := false
+			for k := i + 1; k < n; k++ {
+				if runes[k] == '\'' || runes[k] == '’' {
+					foundClose = true
+					break
+				}
+			}
+
+			prevIsLetter := i-1 >= 0 && (unicode.IsLetter(runes[i-1]) || unicode.IsDigit(runes[i-1]))
+			nextIsLetter := i+1 < n && (unicode.IsLetter(runes[i+1]) || unicode.IsDigit(runes[i+1]))
+
+			if foundClose {
+				// treat as quote delimiter
+				flushWord()
+				toks = append(toks, string(r))
+				continue
+			}
+
+			// No matching later apostrophe: if it's surrounded by letters/digits, treat as contraction char
+			if prevIsLetter && nextIsLetter {
+				b.WriteRune(r)
+				continue
+			}
+
+			// otherwise treat as delimiter
+			flushWord()
+			toks = append(toks, string(r))
+			continue
+		}
+
+		// Word characters
+		if isWordChar(r) {
+			b.WriteRune(r)
+			continue
+		}
+
+		// Punctuation or other symbol: flush any word, then emit the symbol as a token.
+		flushWord()
+		// treat most single non-word, non-space characters as separate tokens
+		toks = append(toks, string(r))
+	}
+
+	flushWord()
+	return toks
+}
+// ...existing code...
+````
+
+Rebuild and test:
+- go test ./...
+- go build ./cmd
+- ./cmd sample.txt output.txt
+
+Tell me if you want a stricter/looser heuristic (e.g., require at least one space after the opening quote, or detect balanced quotes only).
+
+muxtape: That would work if my text is small and contains only one single quote.What would happen if hada multiple quotes inside it.How would i be a able to keep a track of what is word with proper quote usage as an apostrophe and what what text should be inside quotes?
+
+GitHub Copilot: GitHub Copilot
+
+Short answer
+- For multiple quotes you should NOT treat every apostrophe as part of a word. Tokenize apostrophes as separate tokens unless they are genuine internal apostrophes (contractions / O'Connor). Leave those quote tokens to the FSM which should track opening/closing (quoteOpen) across tokens/lines. For nested quotes use a small stack in the FSM (or handle double-quotes separately).
+
+What to do (high level)
+1. Tokenizer:
+   - If apostrophe is surrounded by letters/digits, keep it inside the word (don't split).
+   - Otherwise emit it as a separate token (a quote delimiter).
+   - Optionally, if you want to prefer quote-delimiter when a matching apostrophe exists later on the same input fragment, do a lookahead and treat it as delimiter.
+
+2. FSM:
+   - Treat apostrophe tokens as quote toggles: flip quoteOpen (or push/pop on stack if supporting nesting).
+   - While inside quoteOpen, formatting/case rules behave as "inside-quote".
+   - This cleanly supports multiple quoted spans in the text.
+
+Concrete tokenizer patch
+- Replace the current isWordChar + apostrophe handling with the heuristic below (keeps contractions & O'Connor, emits delimiter otherwise and uses lookahead when desired). Add into pkg/tokenizer/tokenizer.go.
+
+````go
+// ...existing code...
+	for i := 0; i < n; i++ {
+		r := runes[i]
+
+		// Whitespace ...
+		if unicode.IsSpace(r) { flushWord(); continue }
+
+		// Parenthesized command ...
+		if r == '(' { /* ...existing code... */ continue }
+
+		// Apostrophe handling: contraction vs quote delimiter.
+		if r == '\'' || r == '’' {
+			// Look ahead to see if there's a later matching apostrophe in this input.
+			foundClose := false
+			for k := i + 1; k < n; k++ {
+				if runes[k] == '\'' || runes[k] == '’' {
+					foundClose = true
+					break
+				}
+				// stop lookahead at newline or other strong separators if you want
+			}
+
+			prevIsAlphaNum := i-1 >= 0 && (unicode.IsLetter(runes[i-1]) || unicode.IsDigit(runes[i-1]))
+			nextIsAlphaNum := i+1 < n && (unicode.IsLetter(runes[i+1]) || unicode.IsDigit(runes[i+1]))
+
+			if prevIsAlphaNum && nextIsAlphaNum {
+				// internal apostrophe (contraction / O'Connor) -> keep inside word
+				b.WriteRune(r)
+				continue
+			}
+
+			// If a matching close exists in this fragment, prefer treating as quote delimiter.
+			// Otherwise treat as delimiter unless it's internal (handled above).
+			flushWord()
+			toks = append(toks, string(r))
+			continue
+		}
+
+		// Word characters (letters/digits/hyphen)
+		if unicode.IsLetter(r) || unicode.IsDigit(r) || r == '-' {
+			b.WriteRune(r)
+			continue
+		}
+
+		// punctuation ...
+		flushWord()
+		toks = append(toks, string(r))
+	}
+	// ...existing code...
+````
+
+Notes / trade-offs
+- This keeps contractions intact and emits apostrophes as quote tokens for quoted spans including multiple quotes.
+- FSM must toggle quoteOpen on each apostrophe token; that behavior naturally pairs multiple quotes in sequence.
+- Edge cases:
+  - Unbalanced quotes across file boundaries: FSM.Finalize should error or close gracefully.
+  - Nested quoting: add a small stack in FSM and support both single and double quotes if needed.
+  - If you prefer tokenizer to try to pair quotes globally (complex), better to keep pairing logic in FSM where streaming state already exists.
+
+If you want, I can:
+- apply the tokenizer patch for you,
+- and add/update the FSM code to use a quote stack (showing the minimal changes to toggle/pair quotes and ensure formatting inserts the proper space after a closing quote). Which should I do?
+
+muxtape: I will keep the code as is so every time i find a quote i will continue erading the text till i find the slosing quote and then implement the logic needed
+
+GitHub Copilot: GitHub Copilot
+
+Good plan. Short guidance and a small patch you can apply to tokenizer to implement "read until closing quote" behavior while keeping contractions intact.
+
+Why this approach
+- On encountering a quote char, look ahead for a matching closing quote in the same input chunk.
+- If found: flush current word, emit an opening-quote token, recursively tokenize the interior substring (so interior text is properly split into words/punctuation/rules), emit the closing-quote token, advance index to after the close.
+- If not found: fall back to contraction heuristic (apostrophe inside a word) or emit as delimiter.
+- FSM remains responsible for quote pairing across lines/streams if quotes span lines; keep quote tokens so FSM can toggle its quote state.
+
+Patch (replace apostrophe handling inside the for loop in pkg/tokenizer/tokenizer.go):
+
+````go
+// ...existing code...
+		// Apostrophe / quote handling: if there's a matching later quote, treat as a quoted span
+		if r == '\'' || r == '’' {
+			// look for matching same quote rune
+			found := -1
+			for j := i + 1; j < n; j++ {
+				if runes[j] == r {
+					found = j
+					break
+				}
+			}
+
+			if found != -1 {
+				// treat as quoted span: flush anything before, emit opening quote,
+				// tokenize interior recursively, emit closing quote and advance.
+				flushWord()
+				toks = append(toks, string(r)) // opening quote
+				inner := string(runes[i+1 : found])
+				if inner != "" {
+					innerToks := Tokenize(inner)
+					toks = append(toks, innerToks...)
+				}
+				toks = append(toks, string(r)) // closing quote
+				i = found
+				continue
+			}
+
+			// no matching quote later: fall back to contraction/delimiter heuristic
+			prevIsLetter := i-1 >= 0 && (unicode.IsLetter(runes[i-1]) || unicode.IsDigit(runes[i-1]))
+			nextIsLetter := i+1 < n && (unicode.IsLetter(runes[i+1]) || unicode.IsDigit(runes[i+1]))
+			if prevIsLetter && nextIsLetter {
+				// internal apostrophe -> keep inside word (contraction or O'Name)
+				b.WriteRune(r)
+				continue
+			}
+			flushWord()
+			toks = append(toks, string(r))
+			continue
+		}
+````
+
+Notes and caveats
+- This preserves contractions (don't, it's) and treats quoted spans like "test'word hello world'" -> ["test", "'", "word", "hello", "world", "'"] as you want.
+- Nested quotes: this recursive approach will handle nested same-character quotes in a simple way, but be careful with mismatched or alternating quote types (you might want to also handle double quotes differently).
+- Multiline quotes: tokenizer lookahead only works within the current input string. If quotes can span lines/files you must let FSM track unmatched quotes across tokens/lines (it already has quoteOpen state).
+- After this change, ensure FSM treats quote tokens by toggling quoteOpen so formatting will insert space after closing quotes.
+
+Run your tests and try example inputs; tell me if you want me to:
+- implement matching for both single and double quotes,
+- make tokenizer treat different quote characters consistently,
+- or update FSM quote handling to a stack (for nested quotes).
+
+muxtape: Going back to main.go i dont want my program to ouput on the console the message:
+wrote x tokens to output.txt
+make the neccessary changes
+
+GitHub Copilot: GitHub Copilot
+
+Apply this small change to remove the console info line and the unused fmt import.
+
+````go
+// ...existing code...
+-import (
+-	"flag"
+-	"fmt"
+-	"log"
+-	"os"
+-
+-	"platform.zone01.gr/git/atampour/go-reloaded/internal/fsm"
+-	inputpkg "platform.zone01.gr/git/atampour/go-reloaded/pkg/input"
+-	outputpkg "platform.zone01.gr/git/atampour/go-reloaded/pkg/output"
+-	"platform.zone01.gr/git/atampour/go-reloaded/pkg/tokenizer"
+-)
++import (
++	"flag"
++	"log"
++	"os"
++
++	"platform.zone01.gr/git/atampour/go-reloaded/internal/fsm"
++	inputpkg "platform.zone01.gr/git/atampour/go-reloaded/pkg/input"
++	outputpkg "platform.zone01.gr/git/atampour/go-reloaded/pkg/output"
++	"platform.zone01.gr/git/atampour/go-reloaded/pkg/tokenizer"
++)
+ // ...existing code...
+ 
+-	if err := outputpkg.WriteLines(*outPath, ch); err != nil {
+-		log.Fatalf("write output: %v", err)
+-	}
+-
+-	fmt.Fprintf(os.Stdout, "wrote %d tokens to %s\n", len(outTokens), *outPath)
++	if err := outputpkg.WriteLines(*outPath, ch); err != nil {
++		log.Fatalf("write output: %v", err)
++	}
+ // ...existing code...
+````
+
+Rebuild:
+- cd /var/home/student/Desktop/go-reloaded
+- go build ./cmd
+
+Now the program will not print the "wrote x tokens ..." message.
+
+muxtape: There was an extra problem that os package wasnt needed to be imported and i removed it. Was that correct?
+
+
+GitHub Copilot: Yes — that's correct.
+
+You removed os because main.go no longer references fmt or os, so keeping os would cause an unused-import compile error. To verify locally run:
+
+```bash
+cd /var/home/student/Desktop/go-reloaded
+go build ./cmd
+# or run all checks
+go test ./... && go vet ./...
+```
+
+If the build succeeds there are no unused imports. If any other file still imports os unused, the compiler will point it out.
+
+muxtape: --- FAIL: TestTokenize_ContractionAndHyphen (0.00s)
+    tokenizer_test.go:31: Tokenize("don't stop state-of-art") = []string{"don", "'", "t", "stop", "state-of-art"}, want []string{"don't", "stop", "state-of-art"}
+
+    should i change this test because i no longer want the don't  to be a word, so it can stop failing?
+
+GitHub Copilot: Don't change the test — keep "don't" as a single token. Update the tokenizer so internal apostrophes (contractions / O'Name) remain part of a word while still treating quote-delimited spans correctly.
+
+Apply this patch to tokenizer.go (replace the loop body with the updated handling):
+
+````go
+// ...existing code...
+	for i := 0; i < n; i++ {
+		r := runes[i]
+
+		// Whitespace: flush current word and continue.
+		if unicode.IsSpace(r) {
+			flushWord()
+			continue
+		}
+
+		// Parenthesized command: capture until the next ')' (inclusive).
+		if r == '(' {
+			flushWord()
+			var cmd strings.Builder
+			cmd.WriteRune(r)
+			j := i + 1
+			for ; j < n; j++ {
+				cmd.WriteRune(runes[j])
+				if runes[j] == ')' {
+					break
+				}
+			}
+			// advance i to j (if j reached n without ')', it will include rest)
+			i = j
+			toks = append(toks, cmd.String())
+			continue
+		}
+
+		// Apostrophe / single-quote handling: decide between quoted span vs contraction.
+		if r == '\'' || r == '’' {
+			// Look for a later matching quote to treat as quoted span.
+			foundClose := -1
+			for k := i + 1; k < n; k++ {
+				if runes[k] == r {
+					foundClose = k
+					break
+				}
+				// stop lookahead at a newline if you want; here we search whole input fragment
+			}
+			if foundClose != -1 {
+				// quoted span: flush before, emit opening quote, tokenize interior, emit closing quote
+				flushWord()
+				toks = append(toks, string(r)) // opening quote
+				inner := string(runes[i+1 : foundClose])
+				if inner != "" {
+					innerToks := Tokenize(inner)
+					toks = append(toks, innerToks...)
+				}
+				toks = append(toks, string(r)) // closing quote
+				i = foundClose
+				continue
+			}
+
+			// No matching later quote: treat as contraction apostrophe if surrounded by letters/digits.
+			prevIsAlphaNum := i-1 >= 0 && (unicode.IsLetter(runes[i-1]) || unicode.IsDigit(runes[i-1]))
+			nextIsAlphaNum := i+1 < n && (unicode.IsLetter(runes[i+1]) || unicode.IsDigit(runes[i+1]))
+			if prevIsAlphaNum && nextIsAlphaNum {
+				// include inside current word (contraction / O'Name)
+				b.WriteRune(r)
+				continue
+			}
+
+			// otherwise emit as standalone quote token
+			flushWord()
+			toks = append(toks, string(r))
+			continue
+		}
+
+		// Word characters (letters, digits, hyphen)
+		if isWordChar(r) {
+			b.WriteRune(r)
+			continue
+		}
+
+		// Punctuation or other symbol: flush any word, then emit the symbol as a token.
+		flushWord()
+		toks = append(toks, string(r))
+	}
+	// ...existing code...
+````
+
+Run tests after applying:
+```
+cd /var/home/student/Desktop/go-reloaded
+go test ./... 
+```
+
+This preserves contractions like "don't" as a single token while still handling quoted spans and multiple quotes.
+
+muxtape: When i have the following sample text:
+Don't stop 'believing '.
+the program exits with the following error:
+2025/11/08 14:26:15 finalize FSM: unclosed single-quote at EOF
+exit status 1
+
+i would like my putput to be:
+Don't stop 'believing'.
+
+
+GitHub Copilot: GitHub Copilot
+
+Replace the tokenizer with the version that treats quoted spans (reads until the matching quote), preserves contractions (don't) and hyphenated words, and handles parenthesized command tokens. This should stop the unclosed-quote EOF error for the sample and keep "Don't" as a single token.
+
+````go
+package tokenizer
+
+import (
+	"strings"
+	"unicode"
+)
+
+// Tokenize splits input text into tokens: words, punctuation, and command tokens like "(hex)" or "(cap,2)".
+// Rules:
+// - Sequences of letters/digits and hyphens are returned as single word tokens (e.g. state-of-art).
+// - Internal apostrophes that are surrounded by letters/digits are kept inside words (don't, O'Connor).
+// - Quoted spans (opening quote followed later by a matching closing quote) are emitted as:
+//     " ' " , <inner tokens...>, " ' "
+// - Parenthesized command tokens are returned as single tokens including the parentheses, e.g. "(hex)".
+// - Punctuation characters (.,!?;:) are emitted as separate tokens.
+// - Whitespace separates tokens.
+func Tokenize(s string) []string {
+	var toks []string
+	var b strings.Builder
+	runes := []rune(s)
+	n := len(runes)
+
+	flushWord := func() {
+		if b.Len() > 0 {
+			toks = append(toks, b.String())
+			b.Reset()
+		}
+	}
+
+	isWordChar := func(r rune) bool {
+		// Accept letters, digits and hyphen as part of word tokens.
+		return unicode.IsLetter(r) || unicode.IsDigit(r) || r == '-'
+	}
+
+	for i := 0; i < n; i++ {
+		r := runes[i]
+
+		// Whitespace: flush current word and continue.
+		if unicode.IsSpace(r) {
+			flushWord()
+			continue
+		}
+
+		// Parenthesized command: capture until the next ')' (inclusive).
+		if r == '(' {
+			flushWord()
+			var cmd strings.Builder
+			cmd.WriteRune(r)
+			j := i + 1
+			for ; j < n; j++ {
+				cmd.WriteRune(runes[j])
+				if runes[j] == ')' {
+					break
+				}
+			}
+			i = j
+			toks = append(toks, cmd.String())
+			continue
+		}
+
+		// Apostrophe / quote handling: if there's a matching later quote, treat as quoted span.
+		if r == '\'' || r == '’' {
+			// look for matching same quote rune later in this fragment
+			found := -1
+			for j := i + 1; j < n; j++ {
+				if runes[j] == r {
+					found = j
+					break
+				}
+			}
+
+			if found != -1 {
+				// treat as quoted span: flush before, emit opening quote,
+				// tokenize interior recursively, emit closing quote and advance.
+				flushWord()
+				toks = append(toks, string(r)) // opening quote
+				inner := string(runes[i+1 : found])
+				if inner != "" {
+					innerToks := Tokenize(inner)
+					toks = append(toks, innerToks...)
+				}
+				toks = append(toks, string(r)) // closing quote
+				i = found
+				continue
+			}
+
+			// No matching later quote: if it's surrounded by letters/digits, treat as contraction char
+			prevIsAlphaNum := i-1 >= 0 && (unicode.IsLetter(runes[i-1]) || unicode.IsDigit(runes[i-1]))
+			nextIsAlphaNum := i+1 < n && (unicode.IsLetter(runes[i+1]) || unicode.IsDigit(runes[i+1]))
+			if prevIsAlphaNum && nextIsAlphaNum {
+				// internal apostrophe (contraction / O'Name) -> keep inside word
+				b.WriteRune(r)
+				continue
+			}
+
+			// otherwise treat apostrophe as its own token (quote delimiter)
+			flushWord()
+			toks = append(toks, string(r))
+			continue
+		}
+
+		// Word characters (letters, digits, hyphen)
+		if isWordChar(r) {
+			b.WriteRune(r)
+			continue
+		}
+
+		// Punctuation or other symbol: flush any word, then emit the symbol as a token.
+		flushWord()
+		toks = append(toks, string(r))
+	}
+
+	flushWord()
+	return toks
+}
+````
+
+Rebuild and test:
+- cd /var/home/student/Desktop/go-reloaded
+- go test ./...
+- go build ./cmd && ./cmd sample.txt output.txt
+
+This will keep "Don't" as one token, properly emit quoted spans (so FSM sees both opening and closing quote tokens), and avoid the unclosed-quote-at-EOF error for the sample line.
+
+muxtape: Nope it still throws the same error.
+
+GitHub Copilot: GitHub Copilot
+
+Likely cause
+- FSM toggles quote state only for the ASCII apostrophe but your tokenizer (or editor/OS) may emit the Unicode right-single-quote (’). If FSM only checks "'" it will see one quote token (ASCII or Unicode) and then never see a matching close, leaving quoteOpen true at Finalize().
+
+Quick verification (run locally)
+- Print the tokens for the problematic line to confirm what token(s) tokenizer produces:
+
+```go
+package main
+
+import (
+	"fmt"
+	"platform.zone01.gr/git/atampour/go-reloaded/pkg/tokenizer"
+)
+
+func main() {
+	line := "Don't stop 'believing '."
+	fmt.Printf("%q\n", tokenizer.Tokenize(line))
+}
+```
+
+Build+run:
+- go run ./cmd/debug_tokens.go
+
+If output shows a mix of "'" and "’" or only one quote token, that confirms the mismatch.
+
+Minimal fix
+- Make FSM treat both ASCII and Unicode single-quote characters as quote delimiters. Edit ProcessToken in fsm.go to toggle on either token:
+
+````go
+// ...existing code...
+    // Treat single-quote as quote delimiter: toggle quote state and emit token.
+-    if tok == "'" {
++    if tok == "'" || tok == "’" {
+         if err := f.SendEvent(EventToken); err != nil {
+             return fmt.Errorf("on token %q: %w", tok, err)
+         }
+         f.quoteOpen = !f.quoteOpen
+         f.out = append(f.out, tok)
+         return nil
+     }
+````
+
+After applying:
+- go test ./...
+- go build ./cmd
+- ./cmd sample.txt output.txt
+
+If tokenizer output shows only one quote token (i.e., tokenizer missed the closing quote), share the printed token slice here and I’ll propose the tokenizer fix next.
+
+muxtape: i didnt change the code but i changed the quote inside Don't as to not use the same quote as the quotes encasing some words.I didnt know there was a difference between the apostrophe char and the quotes char
+
+GitHub Copilot: GitHub Copilot
+
+You're right — there are two different characters in play:
+
+- ASCII apostrophe: ' (U+0027) — commonly used for contractions ("don't").
+- Right single quotation mark / typographic apostrophe: ’ (U+2019) — often inserted by editors/word processors and used for quotes too.
+
+Because they are distinct runes your tokenizer / FSM can treat them differently unless you handle both. Two simple fixes (pick one):
+
+1) Quick fix — normalize input to ASCII apostrophe before tokenizing (recommended)
+- Add a replace in main.go when reading each line:
+
+````go
+// ...existing code...
+import (
+    "flag"
+    "log"
++   "strings"
+    // ...existing imports...
+)
+// ...existing code...
+    for line := range linesCh {
++        // normalize curly/typographic single-quote to ASCII apostrophe
++        line = strings.ReplaceAll(line, "’", "'")
+        toks := tokenizer.Tokenize(line)
+        // ...existing code...
+    }
+````
+
+2) Robust fix — handle both characters throughout tokenizer + FSM
+- Ensure tokenizer treats both '\'' and '’' the same (you already checked for both in Tokenize).
+- Ensure FSM toggles quoteOpen for both tok == "'" and tok == "’" (update ProcessToken accordingly).
+
+Either approach will stop the unclosed-quote error when your text mixes typographic and ASCII apostrophes. I recommend option 1 as the simplest and safest immediate change. Rebuild and run:
+
+- go build ./cmd
+- ./cmd sample.txt output.txt
+
+muxtape: i want the program  to behave as follows when it finds the apostrrophe char (’).
+I want to not make any changes
+
+GitHub Copilot: GitHub Copilot
+
+Understood. To "not make any changes" when the text contains the typographic apostrophe (U+2019, ’) you should:
+
+- stop normalizing ’ to ASCII in main.go (remove any ReplaceAll that converted it),
+- treat only ASCII apostrophe (') as the quote delimiter in the FSM,
+- treat the typographic apostrophe (’ ) as a normal character in the tokenizer (keep it inside words when appropriate, otherwise emit it as a token but do not toggle quote state).
+
+Apply these edits.
+
+1) Remove normalization (if present) in cmd/main.go:
+
+````go
+// ...existing code...
+-        // normalize curly/typographic single-quote to ASCII apostrophe
+-        line = strings.ReplaceAll(line, "’", "'")
++        // do not normalize typographic apostrophes — leave input unchanged
+         toks := tokenizer.Tokenize(line)
+ // ...existing code...
+````
+
+2) Make tokenizer treat U+2019 as a normal character (not a quote delimiter). Only use ASCII apostrophe for quoted-span handling:
+
+````go
+// ...existing code...
+-        // Apostrophe / quote handling: if there's a matching later quote, treat as quoted span.
+-        if r == '\'' || r == '’' {
++        // Apostrophe / quote handling: treat ASCII apostrophe (') as quote delimiter.
++        // Treat typographic apostrophe (’ U+2019) as ordinary character: include inside a word if
++        // surrounded by letters/digits, otherwise emit it as a token but do not treat it as a quote.
++        if r == '\'' {
+             // look for matching same quote rune later in this fragment
+-            found := -1
+-            for j := i + 1; j < n; j++ {
+-                if runes[j] == r {
+-                    found = j
+-                    break
+-                }
+-            }
+-
+-            if found != -1 {
+-                // treat as quoted span: flush before, emit opening quote,
+-                // tokenize interior recursively, emit closing quote and advance.
+-                flushWord()
+-                toks = append(toks, string(r)) // opening quote
+-                inner := string(runes[i+1 : found])
+-                if inner != "" {
+-                    innerToks := Tokenize(inner)
+-                    toks = append(toks, innerToks...)
+-                }
+-                toks = append(toks, string(r)) // closing quote
+-                i = found
+-                continue
+-            }
+-
+-            // No matching later quote: if it's surrounded by letters/digits, treat as contraction char
+-            prevIsAlphaNum := i-1 >= 0 && (unicode.IsLetter(runes[i-1]) || unicode.IsDigit(runes[i-1]))
+-            nextIsAlphaNum := i+1 < n && (unicode.IsLetter(runes[i+1]) || unicode.IsDigit(runes[i+1]))
+-            if prevIsAlphaNum && nextIsAlphaNum {
+-                // internal apostrophe (contraction / O'Name) -> keep inside word
+-                b.WriteRune(r)
+-                continue
+-            }
+-
+-            // otherwise treat apostrophe as its own token (quote delimiter)
+-            flushWord()
+-            toks = append(toks, string(r))
+-            continue
++            found := -1
++            for j := i + 1; j < n; j++ {
++                if runes[j] == r {
++                    found = j
++                    break
++                }
++            }
++
++            if found != -1 {
++                // quoted span: flush before, emit opening quote, tokenize interior, emit closing quote
++                flushWord()
++                toks = append(toks, string(r)) // opening quote
++                inner := string(runes[i+1 : found])
++                if inner != "" {
++                    innerToks := Tokenize(inner)
++                    toks = append(toks, innerToks...)
++                }
++                toks = append(toks, string(r)) // closing quote
++                i = found
++                continue
++            }
++
++            // No matching later quote: if surrounded by letters/digits treat as contraction.
++            prevIsAlphaNum := i-1 >= 0 && (unicode.IsLetter(runes[i-1]) || unicode.IsDigit(runes[i-1]))
++            nextIsAlphaNum := i+1 < n && (unicode.IsLetter(runes[i+1]) || unicode.IsDigit(runes[i+1]))
++            if prevIsAlphaNum && nextIsAlphaNum {
++                b.WriteRune(r)
++                continue
++            }
++
++            // otherwise standalone ASCII apostrophe token
++            flushWord()
++            toks = append(toks, string(r))
++            continue
++        }
++
++        // handle typographic apostrophe ’ (U+2019): do NOT treat as quote delimiter
++        if r == '’' {
++            prevIsAlphaNum := i-1 >= 0 && (unicode.IsLetter(runes[i-1]) || unicode.IsDigit(runes[i-1]))
++            nextIsAlphaNum := i+1 < n && (unicode.IsLetter(runes[i+1]) || unicode.IsDigit(runes[i+1]))
++            if prevIsAlphaNum && nextIsAlphaNum {
++                // keep as part of the word (contraction-like or name)
++                b.WriteRune(r)
++                continue
++            }
++            // otherwise emit it as its own token but do not treat it as a quote
++            flushWord()
++            toks = append(toks, string(r))
++            continue
++        }
+ // ...existing code...
+````
+
+3) Ensure FSM only toggles quote state for ASCII apostrophe:
+
+````go
+// ...existing code...
+-    // Treat single-quote as quote delimiter: toggle quote state and emit token.
+-    if tok == "'" || tok == "’" {
++    // Treat ASCII single-quote as quote delimiter: toggle quote state and emit token.
++    // Do not toggle for typographic apostrophe U+2019 — leave those characters untouched.
++    if tok == "'" {
+         if err := f.SendEvent(EventToken); err != nil {
+             return fmt.Errorf("on token %q: %w", tok, err)
+         }
+         f.quoteOpen = !f.quoteOpen
+         f.out = append(f.out, tok)
+         return nil
+     }
+````
+
+After applying these three edits:
+- rebuild and test:
+  - cd /var/home/student/Desktop/go-reloaded
+  - go test ./...
+  - go build ./cmd
+  - ./cmd sample.txt output.txt
+
+This will cause the program to leave typographic apostrophes (’) unchanged in output and only treat ASCII apostrophes (') as quote delimiters. If you want the opposite behavior (treat ’ as quote delimiter too, but without normalizing), say so and I will adjust instead.
+
+muxtape: when i have the sample text:
+Don’t ’stop ’ 'believing '.
+
+i want my output to be:
+Don’t ’stop ’ 'believing'.
+
+instead i get:
+Don ’t’ stop ’' believing '.
+
+what changes should  imake?
+
+GitHub Copilot: GitHub Copilot
+
+Make two small changes:
+
+1) Ensure the tokenizer treats both ASCII (') and typographic (’) apostrophes the same way:
+   - If the apostrophe is surrounded by letters/digits -> keep inside the word (contraction / O'Name).
+   - Else if a matching same apostrophe exists later in the same input fragment -> treat as a quoted span (emit opening token, recursively tokenize interior, emit closing token).
+   - Otherwise emit the apostrophe as its own token.
+
+2) Ensure the FSM treats both "'" and "’" as quote delimiters (toggle quote state).
+
+Apply these edits.
+
+````go
+// ...existing code...
+package tokenizer
+
+import (
+	"strings"
+	"unicode"
+)
+
+// ...existing code...
+
+func Tokenize(s string) []string {
+	var toks []string
+	var b strings.Builder
+	runes := []rune(s)
+	n := len(runes)
+
+	flushWord := func() {
+		if b.Len() > 0 {
+			toks = append(toks, b.String())
+			b.Reset()
+		}
+	}
+
+	isWordChar := func(r rune) bool {
+		// Accept letters, digits and hyphen as part of word tokens.
+		return unicode.IsLetter(r) || unicode.IsDigit(r) || r == '-'
+	}
+
+	for i := 0; i < n; i++ {
+		r := runes[i]
+
+		// Whitespace: flush current word and continue.
+		if unicode.IsSpace(r) {
+			flushWord()
+			continue
+		}
+
+		// Parenthesized command: capture until the next ')' (inclusive).
+		if r == '(' {
+			flushWord()
+			var cmd strings.Builder
+			cmd.WriteRune(r)
+			j := i + 1
+			for ; j < n; j++ {
+				cmd.WriteRune(runes[j])
+				if runes[j] == ')' {
+					break
+				}
+			}
+			i = j
+			toks = append(toks, cmd.String())
+			continue
+		}
+
+		// Handle ASCII apostrophe (') and typographic apostrophe (’) uniformly:
+		// - If surrounded by letters/digits -> keep inside current word (contraction/O'Name).
+		// - Else if there's a later matching same apostrophe in this fragment -> treat as quoted span.
+		// - Otherwise emit as a standalone token.
+		if r == '\'' || r == '’' {
+			// check if contraction-like (inside a word)
+			prevIsAlphaNum := i-1 >= 0 && (unicode.IsLetter(runes[i-1]) || unicode.IsDigit(runes[i-1]))
+			nextIsAlphaNum := i+1 < n && (unicode.IsLetter(runes[i+1]) || unicode.IsDigit(runes[i+1]))
+			if prevIsAlphaNum && nextIsAlphaNum {
+				// internal apostrophe -> keep in word
+				b.WriteRune(r)
+				continue
+			}
+
+			// look for later matching same apostrophe to form a quoted span
+			found := -1
+			for j := i + 1; j < n; j++ {
+				if runes[j] == r {
+					found = j
+					break
+				}
+			}
+			if found != -1 {
+				// quoted span: flush before, emit opening quote, tokenize interior, emit closing quote
+				flushWord()
+				toks = append(toks, string(r)) // opening quote
+				inner := string(runes[i+1 : found])
+				if inner != "" {
+					innerToks := Tokenize(inner)
+					toks = append(toks, innerToks...)
+				}
+				toks = append(toks, string(r)) // closing quote
+				i = found
+				continue
+			}
+
+			// otherwise standalone apostrophe token
+			flushWord()
+			toks = append(toks, string(r))
+			continue
+		}
+
+		// Word characters (letters, digits, hyphen)
+		if isWordChar(r) {
+			b.WriteRune(r)
+			continue
+		}
+
+		// Punctuation or other symbol: flush any word, then emit the symbol as a token.
+		flushWord()
+		toks = append(toks, string(r))
+	}
+
+	flushWord()
+	return toks
+}
+// ...existing code...
+````
+
+````go
+// ...existing code...
+func (f *FSM) ProcessToken(tok string) error {
+    // Treat ASCII and typographic single-quote as quote delimiter: toggle quote state and emit token.
+-    if tok == "'" {
++    if tok == "'" || tok == "’" {
+         if err := f.SendEvent(EventToken); err != nil {
+             return fmt.Errorf("on token %q: %w", tok, err)
+         }
+         f.quoteOpen = !f.quoteOpen
+         f.out = append(f.out, tok)
+         return nil
+     }
+ // ...existing code...
+}
+````
+
+Rebuild and test:
+
+- cd /var/home/student/Desktop/go-reloaded
+- go test ./...
+- go build ./cmd
+- ./cmd sample.txt output.txt
+
+Result:
+- "Don’t" remains a single token (typographic apostrophe kept inside the word).
+- Quoted spans using typographic apostrophes (e.g. ’stop ’) are preserved as quoted tokens.
+- ASCII quotes (') are treated as quote delimiters as well.
+- Final formatting will place a space after a closing quote when appropriate and attach punctuation like '.' directly after closing quotes per your formatter rules.
