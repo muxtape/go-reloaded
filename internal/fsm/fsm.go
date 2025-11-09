@@ -334,6 +334,44 @@ func normalizeArticles(out *[]string) {
 	}
 }
 
+// applyRule centralizes handling of "(...)" rule tokens.
+func (f *FSM) applyRule(ruleTok string) error {
+	// only called for parenthesized tokens with len > 1
+	if err := f.SendEvent(EventRule); err != nil {
+		return fmt.Errorf("on token %q: %w", ruleTok, err)
+	}
+
+	lower := strings.ToLower(ruleTok)
+	switch lower {
+	case "(hex)":
+		if err := f.applyHexRule(&f.out); err != nil {
+			return fmt.Errorf("on token %q: %w", ruleTok, err)
+		}
+	case "(bin)":
+		if err := f.applyBinRule(&f.out); err != nil {
+			return fmt.Errorf("on token %q: %w", ruleTok, err)
+		}
+	case "(a/an)":
+		// Mark pendingArticle for streaming use; in batch Process the caller may pre-resolve.
+		f.pendingArticle = true
+	default:
+		if strings.HasPrefix(lower, "(up") || strings.HasPrefix(lower, "(low") || strings.HasPrefix(lower, "(cap") {
+			if err := f.applyCaseRule(ruleTok, &f.out); err != nil {
+				return fmt.Errorf("on token %q: %w", ruleTok, err)
+			}
+		}
+		// unknown rules are no-op
+	}
+
+	if err := f.SendEvent(EventEmit); err != nil {
+		return fmt.Errorf("on token %q: %w", ruleTok, err)
+	}
+	if err := f.SendEvent(EventToken); err != nil {
+		return fmt.Errorf("on token %q: %w", ruleTok, err)
+	}
+	return nil
+}
+
 // ProcessToken handles a single token in streaming mode.
 // It updates internal FSM state and the internal output buffer.
 // It does not perform EOF checks; call Finalize() when input is finished.
@@ -383,39 +421,9 @@ func (f *FSM) ProcessToken(tok string) error {
 		// fall through and treat current tok as normal token (it will be appended below)
 	}
 
-	// Rule tokens (parenthesized)
-	if len(tok) > 1 && tok[0] == '(' { // only treat "(...)" (not a lone "(") as a rule token
-		if err := f.SendEvent(EventRule); err != nil {
-			return fmt.Errorf("on token %q: %w", tok, err)
-		}
-		lower := strings.ToLower(tok)
-		switch lower {
-		case "(hex)":
-			if err := f.applyHexRule(&f.out); err != nil {
-				return fmt.Errorf("on token %q: %w", tok, err)
-			}
-		case "(bin)":
-			if err := f.applyBinRule(&f.out); err != nil {
-				return fmt.Errorf("on token %q: %w", tok, err)
-			}
-		case "(a/an)":
-			// mark pending and wait for next word token to apply
-			f.pendingArticle = true
-		default:
-			if strings.HasPrefix(lower, "(up") || strings.HasPrefix(lower, "(low") || strings.HasPrefix(lower, "(cap") {
-				if err := f.applyCaseRule(tok, &f.out); err != nil {
-					return fmt.Errorf("on token %q: %w", tok, err)
-				}
-			}
-			// unknown rules are no-op
-		}
-		if err := f.SendEvent(EventEmit); err != nil {
-			return fmt.Errorf("on token %q: %w", tok, err)
-		}
-		if err := f.SendEvent(EventToken); err != nil {
-			return fmt.Errorf("on token %q: %w", tok, err)
-		}
-		return nil
+	// Rule tokens (parenthesized) - only treat full "(...)" tokens as rules; a lone "(" is regular token.
+	if len(tok) > 1 && tok[0] == '(' {
+		return f.applyRule(tok)
 	}
 
 	// Regular token: append and advance

@@ -62,7 +62,14 @@ func main() {
 	ch <- formatted
 	close(ch)
 
-	if err := outputpkg.WriteLines(*outPath, ch); err != nil {
-		log.Fatalf("write output: %v", err)
+	// Use WriteLinesWithErr to perform writes in a goroutine and observe any errors.
+	errs, werr := outputpkg.WriteLinesWithErr(*outPath, ch)
+	if werr != nil {
+		log.Fatalf("create output writer: %v", werr)
+	}
+	for e := range errs {
+		if e != nil {
+			log.Fatalf("write output: %v", e)
+		}
 	}
 }

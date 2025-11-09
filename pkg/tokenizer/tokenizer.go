@@ -33,6 +33,43 @@ func Tokenize(s string) []string {
 		return unicode.IsLetter(r) || unicode.IsDigit(r) || r == '-'
 	}
 
+	// scan ahead to decide if this parenthesis is a command (emit "(compact)") and return
+	// new index (j) if we consumed it; else return -1 to indicate don't skip inner content.
+	scanParenCommand := func(i int) (token string, newIdx int) {
+		j := i + 1
+		for j < n && runes[j] != ')' {
+			j++
+		}
+		if j >= n || runes[j] != ')' {
+			return "", -1
+		}
+		inner := string(runes[i+1 : j])
+		compact := strings.ReplaceAll(inner, " ", "")
+		if compact == "" {
+			return "", -1
+		}
+		// allowed command characters
+		for _, rr := range compact {
+			if !(unicode.IsLetter(rr) || unicode.IsDigit(rr) || rr == ',' || rr == '-' || rr == '.' || rr == ':' || rr == '%') {
+				return "", -1
+			}
+		}
+		lc := strings.ToLower(compact)
+		whitelist := map[string]bool{"hex": true, "bin": true, "cap": true, "low": true, "up": true}
+		if strings.Contains(compact, ",") || whitelist[lc] {
+			return "(" + compact + ")", j
+		}
+		return "", -1
+	}
+
+	// get last rune from builder string (used to inspect prior char for apostrophe logic)
+	utf8LastRune := func(s string) (rune, int) {
+		if s == "" {
+			return 0, 0
+		}
+		return utf8.DecodeLastRuneInString(s)
+	}
+
 	for i := 0; i < n; i++ {
 		r := runes[i]
 
@@ -42,46 +79,15 @@ func Tokenize(s string) []string {
 			continue
 		}
 
-		// Parenthesized command: capture until the next ')' (inclusive) only when
-		// the inner part looks like a command (e.g. "hex", "cap,2", "low, 3").
+		// Parenthesis handling: try to parse as a command "(...)" first.
 		if r == '(' {
-			// scan ahead for matching ')'
-			j := i + 1
-			for j < n && runes[j] != ')' {
-				j++
+			if tok, j := scanParenCommand(i); j != -1 {
+				flushWord()
+				toks = append(toks, tok)
+				i = j // advance past ')'
+				continue
 			}
-			if j < n && runes[j] == ')' {
-				inner := string(runes[i+1 : j])
-				// Normalize by removing spaces to allow "(low, 3)" -> "(low,3)"
-				compact := strings.ReplaceAll(inner, " ", "")
-				if compact != "" {
-					// allowed character set for command payload
-					allowed := true
-					for _, rr := range compact {
-						if !(unicode.IsLetter(rr) || unicode.IsDigit(rr) || rr == ',' || rr == '-' || rr == '.' || rr == ':' || rr == '%') {
-							allowed = false
-							break
-						}
-					}
-					if allowed {
-						// accept as command token only if compact either contains a comma (has args)
-						// or matches a small whitelist of known single-word commands.
-						lc := strings.ToLower(compact)
-						whitelist := map[string]bool{
-							"hex": true, "bin": true, "cap": true, "low": true, "up": true,
-						}
-						if strings.Contains(compact, ",") || whitelist[lc] {
-							flushWord()
-							// emit normalized token without internal spaces so FSM parsing is stable
-							toks = append(toks, "("+compact+")")
-							i = j // advance past the ')'
-							continue
-						}
-					}
-				}
-				// otherwise fallthrough: treat '(' as standalone token and let loop handle inner text
-			}
-			// no matching ')' or inner not allowed: treat '(' as its own token
+			// otherwise treat '(' as its own token and continue (inner text will be tokenized normally)
 			flushWord()
 			toks = append(toks, "(")
 			continue
@@ -89,10 +95,8 @@ func Tokenize(s string) []string {
 
 		// Handle ASCII apostrophe (') and typographic apostrophe (’) uniformly:
 		// - If surrounded by letters/digits -> keep inside current word (contraction/O'Name).
-		// - Else if there's a later matching same apostrophe in this fragment -> treat as quoted span.
-		// - Otherwise emit as a standalone token.
+		// - Otherwise emit as a standalone quote token.
 		if r == '\'' || r == '’' {
-			// check if we are inside a word (previous and next are letters/digits)
 			prevIs := false
 			nextIs := false
 			if b.Len() > 0 {
@@ -104,11 +108,9 @@ func Tokenize(s string) []string {
 				nextIs = unicode.IsLetter(nextRune) || unicode.IsDigit(nextRune)
 			}
 			if prevIs && nextIs {
-				// keep apostrophe inside word
 				b.WriteRune(r)
 				continue
 			}
-			// otherwise treat as standalone quote token
 			flushWord()
 			toks = append(toks, string(r))
 			continue
@@ -127,18 +129,4 @@ func Tokenize(s string) []string {
 
 	flushWord()
 	return toks
-}
-
-// helper to get last rune of a string (used above)
-func utf8LastRune(s string) (rune, int) {
-	if s == "" {
-		return 0, 0
-	}
-	r, size := rune(s[len(s)-1]), 1
-	// rough fallback: iterate runes to find last one
-	for i := len(s) - 1; i >= 0; {
-		r, size = utf8.DecodeLastRuneInString(s[:i+1])
-		return r, size
-	}
-	return r, size
 }

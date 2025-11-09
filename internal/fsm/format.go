@@ -2,28 +2,39 @@ package fsm
 
 import "strings"
 
+// helper: punctuation categories
+var closingPunct = map[string]bool{
+    ".":   true,
+    ",":   true,
+    "!":   true,
+    "?":   true,
+    ";":   true,
+    ":":   true,
+    ")":   true,
+    "]":   true,
+    "}":   true,
+    "...": true,
+}
+
+var openingPunct = map[string]bool{
+    "(": true,
+    "[": true,
+    "{": true,
+}
+
+func isClosing(tok string) bool { return closingPunct[tok] }
+func isOpening(tok string) bool { return openingPunct[tok] }
+
 // FormatTokens joins token slice into a single string applying punctuation spacing rules.
 func FormatTokens(tokens []string) string {
     if len(tokens) == 0 {
         return ""
     }
 
-    closing := map[string]bool{
-        ".": true, ",": true, "!": true, "?": true, ";": true, ":": true,
-        ")": true, "]": true, "}": true,
-        "...": true,
-    }
-
-    opening := map[string]bool{
-        "(": true, "[": true, "{": true,
-    }
-
     var b strings.Builder
     quoteOpen := false
     atLineStart := true
     var prev string
-
-    // new: track whether the previous single-quote token was an opening quote
     prevWasOpeningQuote := false
 
     for _, tok := range tokens {
@@ -76,7 +87,7 @@ func FormatTokens(tokens []string) string {
         }
 
         // Closing punctuation: no space before it.
-        if closing[tok] {
+        if isClosing(tok) {
             b.WriteString(tok)
             prev = tok
             prevWasOpeningQuote = false
@@ -84,7 +95,7 @@ func FormatTokens(tokens []string) string {
         }
 
         // If previous token was an opening punctuation (or an opening single-quote), do not add a space before current token.
-        if opening[prev] || prevWasOpeningQuote {
+        if isOpening(prev) || prevWasOpeningQuote {
             b.WriteString(tok)
             prev = tok
             prevWasOpeningQuote = false
