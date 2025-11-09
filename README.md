@@ -3,7 +3,7 @@
 A small streaming text transformer written in Go. Input text is tokenized, processed by a finite-state machine (FSM) that applies transformation rules (case changes, hex/bin conversions, article fixes, quote normalization, etc.), then formatted and written back to output. The tool is designed for incremental/streaming processing and easy extension with new rules.
 
 Badges
-[![CI](https://github.com/OWNER/REPO/actions/workflows/ci.yml/badge.svg)](https://github.com/OWNER/REPO/actions/workflows/ci.yml)
+[![CI](https://github.com/muxtape/go-reloaded/actions/workflows/ci.yml/badge.svg)](https://github.com/muxtape/go-reloaded/actions/workflows/ci.yml)
 - CI: .github/workflows/ci.yml runs tests, go vet and staticcheck.
 
 Quick summary
