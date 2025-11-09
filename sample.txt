@@ -8,7 +8,7 @@ harold wilson (cap, 2) : ' I am a optimist ,but a optimist who carries a raincoa
 
 This is a tricky sample (cap, 2) (low) text
 
-This is a 'tricky (up) ' sample text
+This is a ' tricky (up) ' sample text
 
 This is a A0 (hex) tricky sample text
 
@@ -16,8 +16,9 @@ This is a . (up) . . tricky sample text
 
 This is a B (hex) (bin) tricky sample text
 
-state-of-art (up,4)
-
+hello state-of-art (up, 4)
 Don’t ’stop ’ 'believing '.
+
+hello (this is a test (up,2)) 
 
 Lorem ipsum dolor (up, 2) sit amet, consectetur adipiscing elit, sed do eiusmod (cap), 11 (bin) tempor incididunt ut labore et dolore magna aliqua. Ut 'enim (up)' ad minim veniam, quis nostrud exercitation ullamco laboris nisi ut aliquip ex ea ' commodo consequat'. Duis (low) aute irure dolor in reprehenderit in voluptate B (hex) velit esse cillum dolore eu fugiat nulla pariatur. . . Excepteur sint a occaecat cupidatat non proident, sunt in (cap, 3) (low, 2) culpa qui officia deserunt mollit anim id est laborum.

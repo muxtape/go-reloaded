@@ -14,11 +14,12 @@ This is a 160 tricky sample text
 
 This is A... tricky sample text
 
-This is a 3 tricky sample TEXT
+This is a 3 tricky SAMPLE TEXT
 
-STATE-OF-ART
-
+HELLO STATE-OF-ART
 Don’t ’stop’ 'believing'.
+
+hello (this is A TEST)
 
 Lorem IPSUM DOLOR sit amet, consectetur adipiscing elit, sed do Eiusmod, 3 tempor incididunt ut labore et dolore magna aliqua. Ut 'ENIM' ad minim veniam, quis nostrud exercitation ullamco laboris nisi ut aliquip ex ea 'commodo consequat'. duis aute irure dolor in reprehenderit in voluptate 11 velit esse cillum dolore eu fugiat nulla pariatur... Excepteur sint an occaecat cupidatat non Proident, sunt in culpa qui officia deserunt mollit anim id est laborum.
 

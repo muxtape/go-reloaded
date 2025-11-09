@@ -3,6 +3,7 @@ package tokenizer
 import (
 	"strings"
 	"unicode"
+	"unicode/utf8"
 )
 
 // Tokenize splits input text into tokens: words, punctuation, and command tokens like "(hex)" or "(cap,2)".
@@ -41,20 +42,48 @@ func Tokenize(s string) []string {
 			continue
 		}
 
-		// Parenthesized command: capture until the next ')' (inclusive).
+		// Parenthesized command: capture until the next ')' (inclusive) only when
+		// the inner part looks like a command (e.g. "hex", "cap,2", "low, 3").
 		if r == '(' {
-			flushWord()
-			var cmd strings.Builder
-			cmd.WriteRune(r)
+			// scan ahead for matching ')'
 			j := i + 1
-			for ; j < n; j++ {
-				cmd.WriteRune(runes[j])
-				if runes[j] == ')' {
-					break
-				}
+			for j < n && runes[j] != ')' {
+				j++
 			}
-			i = j
-			toks = append(toks, cmd.String())
+			if j < n && runes[j] == ')' {
+				inner := string(runes[i+1 : j])
+				// Normalize by removing spaces to allow "(low, 3)" -> "(low,3)"
+				compact := strings.ReplaceAll(inner, " ", "")
+				if compact != "" {
+					// allowed character set for command payload
+					allowed := true
+					for _, rr := range compact {
+						if !(unicode.IsLetter(rr) || unicode.IsDigit(rr) || rr == ',' || rr == '-' || rr == '.' || rr == ':' || rr == '%') {
+							allowed = false
+							break
+						}
+					}
+					if allowed {
+						// accept as command token only if compact either contains a comma (has args)
+						// or matches a small whitelist of known single-word commands.
+						lc := strings.ToLower(compact)
+						whitelist := map[string]bool{
+							"hex": true, "bin": true, "cap": true, "low": true, "up": true,
+						}
+						if strings.Contains(compact, ",") || whitelist[lc] {
+							flushWord()
+							// emit normalized token without internal spaces so FSM parsing is stable
+							toks = append(toks, "("+compact+")")
+							i = j // advance past the ')'
+							continue
+						}
+					}
+				}
+				// otherwise fallthrough: treat '(' as standalone token and let loop handle inner text
+			}
+			// no matching ')' or inner not allowed: treat '(' as its own token
+			flushWord()
+			toks = append(toks, "(")
 			continue
 		}
 
@@ -63,38 +92,23 @@ func Tokenize(s string) []string {
 		// - Else if there's a later matching same apostrophe in this fragment -> treat as quoted span.
 		// - Otherwise emit as a standalone token.
 		if r == '\'' || r == '’' {
-			// check if contraction-like (inside a word)
-			prevIsAlphaNum := i-1 >= 0 && (unicode.IsLetter(runes[i-1]) || unicode.IsDigit(runes[i-1]))
-			nextIsAlphaNum := i+1 < n && (unicode.IsLetter(runes[i+1]) || unicode.IsDigit(runes[i+1]))
-			if prevIsAlphaNum && nextIsAlphaNum {
-				// internal apostrophe -> keep in word
+			// check if we are inside a word (previous and next are letters/digits)
+			prevIs := false
+			nextIs := false
+			if b.Len() > 0 {
+				pr, _ := utf8LastRune(b.String())
+				prevIs = unicode.IsLetter(pr) || unicode.IsDigit(pr)
+			}
+			if i+1 < n {
+				nextRune := runes[i+1]
+				nextIs = unicode.IsLetter(nextRune) || unicode.IsDigit(nextRune)
+			}
+			if prevIs && nextIs {
+				// keep apostrophe inside word
 				b.WriteRune(r)
 				continue
 			}
-
-			// look for later matching same apostrophe to form a quoted span
-			found := -1
-			for j := i + 1; j < n; j++ {
-				if runes[j] == r {
-					found = j
-					break
-				}
-			}
-			if found != -1 {
-				// quoted span: flush before, emit opening quote, tokenize interior, emit closing quote
-				flushWord()
-				toks = append(toks, string(r)) // opening quote
-				inner := string(runes[i+1 : found])
-				if inner != "" {
-					innerToks := Tokenize(inner)
-					toks = append(toks, innerToks...)
-				}
-				toks = append(toks, string(r)) // closing quote
-				i = found
-				continue
-			}
-
-			// otherwise standalone apostrophe token
+			// otherwise treat as standalone quote token
 			flushWord()
 			toks = append(toks, string(r))
 			continue
@@ -113,4 +127,18 @@ func Tokenize(s string) []string {
 
 	flushWord()
 	return toks
+}
+
+// helper to get last rune of a string (used above)
+func utf8LastRune(s string) (rune, int) {
+	if s == "" {
+		return 0, 0
+	}
+	r, size := rune(s[len(s)-1]), 1
+	// rough fallback: iterate runes to find last one
+	for i := len(s) - 1; i >= 0; {
+		r, size = utf8.DecodeLastRuneInString(s[:i+1])
+		return r, size
+	}
+	return r, size
 }

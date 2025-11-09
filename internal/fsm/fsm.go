@@ -17,7 +17,9 @@ const (
 )
 
 // exported token used to mark original input line breaks
-const LineBreakToken = "<LINE_BREAK>"
+// Use a non-alphanumeric sentinel so token-is-word checks (which look for letters/digits)
+// will not mistake the line-break marker for a real word. 0x1E (Record Separator) is non-printable.
+const LineBreakToken = "\x1E"
 
 func (s State) String() string {
 	switch s {
@@ -295,7 +297,7 @@ func (f *FSM) applyArticleRule(out *[]string, tokens []string, i int) error {
 
 // helper: return first letter or digit rune (lowercased) from s, skipping leading non-letter/digit
 func firstLetterOrDigit(s string) (rune, bool) {
-	for _, r := range []rune(s) {
+	for _, r := range s {
 		if unicode.IsLetter(r) || unicode.IsDigit(r) {
 			return unicode.ToLower(r), true
 		}
@@ -382,7 +384,7 @@ func (f *FSM) ProcessToken(tok string) error {
 	}
 
 	// Rule tokens (parenthesized)
-	if len(tok) > 0 && tok[0] == '(' {
+	if len(tok) > 1 && tok[0] == '(' { // only treat "(...)" (not a lone "(") as a rule token
 		if err := f.SendEvent(EventRule); err != nil {
 			return fmt.Errorf("on token %q: %w", tok, err)
 		}
