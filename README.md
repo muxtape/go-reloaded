@@ -4,7 +4,7 @@ A small streaming text transformer written in Go. Input text is tokenized, proce
 
 Badges
 
-[![CI](https://github.com/muxtape/go-reloaded/actions/workflows/ci.yml/badge.svg)](https://github.com/muxtape/go-reloaded/actions/workflows/ci.yml)
+[![CI](https://github.com/muxtape/go-reloaded/actions/workflows/ci.yaml/badge.svg)](https://github.com/muxtape/go-reloaded/actions/workflows/ci.yaml)
 - CI: .github/workflows/ci.yml runs tests, go vet and staticcheck.
 
 Quick summary

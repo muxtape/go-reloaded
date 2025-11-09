@@ -1,0 +1,84 @@
+?   	platform.zone01.gr/git/atampour/go-reloaded/cmd	[no test files]
+=== RUN   TestFSM_Article_Vowel
+--- PASS: TestFSM_Article_Vowel (0.00s)
+=== RUN   TestFSM_Article_H
+--- PASS: TestFSM_Article_H (0.00s)
+=== RUN   TestFSM_Article_NoChange
+--- PASS: TestFSM_Article_NoChange (0.00s)
+=== RUN   TestFSM_Article_NoPrevA_Error
+--- PASS: TestFSM_Article_NoPrevA_Error (0.00s)
+=== RUN   TestFSM_BinRule_Success
+--- PASS: TestFSM_BinRule_Success (0.00s)
+=== RUN   TestFSM_BinRule_WithPrefix_Success
+--- PASS: TestFSM_BinRule_WithPrefix_Success (0.00s)
+=== RUN   TestFSM_BinRule_InvalidBin
+--- PASS: TestFSM_BinRule_InvalidBin (0.00s)
+=== RUN   TestFSM_Case_Up
+--- PASS: TestFSM_Case_Up (0.00s)
+=== RUN   TestFSM_Case_Low
+--- PASS: TestFSM_Case_Low (0.00s)
+=== RUN   TestFSM_Case_Cap_DefaultCount
+--- PASS: TestFSM_Case_Cap_DefaultCount (0.00s)
+=== RUN   TestFSM_Case_Cap_WithCount
+--- PASS: TestFSM_Case_Cap_WithCount (0.00s)
+=== RUN   TestFSM_Case_Cap_SkipPunctuation
+--- PASS: TestFSM_Case_Cap_SkipPunctuation (0.00s)
+=== RUN   TestFSM_Case_NotEnoughWords
+--- PASS: TestFSM_Case_NotEnoughWords (0.00s)
+=== RUN   TestFormatTokens_BasicPunctuation
+--- PASS: TestFormatTokens_BasicPunctuation (0.00s)
+=== RUN   TestFormatTokens_Parentheses
+--- PASS: TestFormatTokens_Parentheses (0.00s)
+=== RUN   TestFormatTokens_Ellipsis
+--- PASS: TestFormatTokens_Ellipsis (0.00s)
+=== RUN   TestFormatTokens_Mixed
+--- PASS: TestFormatTokens_Mixed (0.00s)
+=== RUN   TestFSM_HexRule_Success
+--- PASS: TestFSM_HexRule_Success (0.00s)
+=== RUN   TestFSM_HexRule_InvalidHex
+--- PASS: TestFSM_HexRule_InvalidHex (0.00s)
+=== RUN   TestFSM_Integration_Golden
+--- PASS: TestFSM_Integration_Golden (0.00s)
+=== RUN   TestFSM_ProcessIdentity
+--- PASS: TestFSM_ProcessIdentity (0.00s)
+=== RUN   TestFSM_Quote_SingleWord
+--- PASS: TestFSM_Quote_SingleWord (0.00s)
+=== RUN   TestFSM_Quote_MultiWord
+--- PASS: TestFSM_Quote_MultiWord (0.00s)
+=== RUN   TestFSM_Quote_Unmatched
+--- PASS: TestFSM_Quote_Unmatched (0.00s)
+=== RUN   TestFSM_InitialState
+--- PASS: TestFSM_InitialState (0.00s)
+=== RUN   TestFSM_ValidTransitions
+--- PASS: TestFSM_ValidTransitions (0.00s)
+=== RUN   TestFSM_InvalidTransition
+--- PASS: TestFSM_InvalidTransition (0.00s)
+PASS
+ok  	platform.zone01.gr/git/atampour/go-reloaded/internal/fsm	(cached)
+=== RUN   TestBootstrap
+    bootstrap_test.go:6: bootstrap OK
+--- PASS: TestBootstrap (0.00s)
+PASS
+ok  	platform.zone01.gr/git/atampour/go-reloaded/pkg/bootstrap	(cached)
+=== RUN   TestReadLines_Success
+--- PASS: TestReadLines_Success (0.00s)
+=== RUN   TestReadLines_InvalidPath
+--- PASS: TestReadLines_InvalidPath (0.00s)
+PASS
+ok  	platform.zone01.gr/git/atampour/go-reloaded/pkg/input	(cached)
+=== RUN   TestWriteLines_Success
+--- PASS: TestWriteLines_Success (0.00s)
+PASS
+ok  	platform.zone01.gr/git/atampour/go-reloaded/pkg/output	(cached)
+=== RUN   TestTokenize_RefactorEdgeCases
+--- PASS: TestTokenize_RefactorEdgeCases (0.00s)
+=== RUN   TestTokenize_SimplePunctuation
+--- PASS: TestTokenize_SimplePunctuation (0.00s)
+=== RUN   TestTokenize_CommandsAndWords
+--- PASS: TestTokenize_CommandsAndWords (0.00s)
+=== RUN   TestTokenize_ContractionAndHyphen
+--- PASS: TestTokenize_ContractionAndHyphen (0.00s)
+=== RUN   TestTokenize_ParenthesizedComplex
+--- PASS: TestTokenize_ParenthesizedComplex (0.00s)
+PASS
+ok  	platform.zone01.gr/git/atampour/go-reloaded/pkg/tokenizer	(cached)
